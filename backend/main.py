@@ -72,7 +72,7 @@ async def _atualizar_depara() -> int:
         omie = OmieClient(os.environ["OMIE_APP_KEY"], os.environ["OMIE_APP_SECRET"], http)
         async for p in omie.paginate(
             "geral/produtos/", "ListarProdutos",
-            {"filtrarPorTipo": "P", "inativo": "N", "exibirCaracteristicas": "N"},
+            {"filtrarPorTipo": "P", "inativo": "N"},
             chave_registros="produto_servico_cadastro", por_pagina=50,
         ):
             sku  = (p.get("codigo") or p.get("codigo_produto") or "").strip().upper()
