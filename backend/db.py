@@ -34,6 +34,13 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS meta (
                 mes INTEGER PRIMARY KEY, valor REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS produtos_cache (
+                sku         TEXT PRIMARY KEY,
+                descricao   TEXT,
+                linha       TEXT,
+                categoria   TEXT,
+                atualizado_em TEXT
+            );
             CREATE TABLE IF NOT EXISTS coleta_status (
                 id              INTEGER PRIMARY KEY CHECK (id = 1),
                 ultima_coleta   TEXT,
@@ -47,12 +54,10 @@ def init_db() -> None:
             INSERT OR IGNORE INTO coleta_status (id, em_andamento)
             VALUES (1, 0);
         """)
-        # Migration: adiciona cancelar_coleta se não existir
         cols = [r[1] for r in conn.execute("PRAGMA table_info(coleta_status)").fetchall()]
         if "cancelar_coleta" not in cols:
             conn.execute("ALTER TABLE coleta_status ADD COLUMN cancelar_coleta INTEGER DEFAULT 0")
             log.info("Migration: coluna cancelar_coleta adicionada")
-    # Reseta lock travado de processo anterior
     with _conn() as conn:
         conn.execute("UPDATE coleta_status SET em_andamento=0, cancelar_coleta=0 WHERE id=1 AND em_andamento=1")
     log.info("Banco em %s", DB_PATH)
@@ -73,6 +78,12 @@ def _conn():
         conn.close()
 
 
+def get_chaves_faturamento_existentes() -> set[str]:
+    with _conn() as conn:
+        rows = conn.execute("SELECT DISTINCT chave_nf FROM faturamento").fetchall()
+        return {row["chave_nf"] for row in rows}
+
+
 def upsert_faturamento(linhas: list[dict]) -> int:
     if not linhas:
         return 0
@@ -87,6 +98,8 @@ def upsert_faturamento(linhas: list[dict]) -> int:
 
 
 def upsert_clientes(clientes: list[dict]) -> None:
+    if not clientes:
+        return
     sql = "INSERT OR REPLACE INTO clientes (cod_cliente,nome,cnpj,cidade,uf,rep) VALUES (:cod_cliente,:nome,:cnpj,:cidade,:uf,:rep)"
     with _conn() as conn:
         conn.executemany(sql, clientes)
@@ -144,13 +157,43 @@ def get_data_payload() -> dict:
             FROM faturamento
             GROUP BY ano, mes, uf, rep, linha, categoria, fragancia, item
         """).fetchall()
-        rows_cli = conn.execute("SELECT nome, cnpj, cidade, uf, rep, cod_cliente FROM clientes ORDER BY nome").fetchall()
+        rows_cli = conn.execute("SELECT cod_cliente, nome, cnpj, cidade, uf, rep FROM clientes ORDER BY nome").fetchall()
         rows_meta = conn.execute("SELECT mes, valor FROM meta").fetchall()
 
     return {
         "DATA":      [dict(r) for r in rows_fat],
         "ITEM_DATA": [dict(r) for r in rows_item],
-        "CLIENTS":   [[r["nome"], r["cnpj"], r["cidade"]] for r in rows_cli],
+        "CLIENTS":   [dict(r) for r in rows_cli],
         "META":      {str(r["mes"]): r["valor"] for r in rows_meta},
         "total_registros": len(rows_fat),
     }
+
+
+def get_produto_cache(sku: str) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT sku, descricao, linha, categoria FROM produtos_cache WHERE sku = ?",
+            (sku,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_produto_cache(sku: str, descricao: str, linha: str, categoria: str) -> None:
+    from datetime import datetime as _dt
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO produtos_cache (sku, descricao, linha, categoria, atualizado_em)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(sku) DO UPDATE SET
+                 descricao = excluded.descricao,
+                 linha = excluded.linha,
+                 categoria = excluded.categoria,
+                 atualizado_em = excluded.atualizado_em""",
+            (sku, descricao, linha, categoria, _dt.now().isoformat())
+        )
+
+
+def get_todos_produtos_cache() -> dict[str, dict]:
+    with _conn() as conn:
+        rows = conn.execute("SELECT sku, descricao, linha, categoria FROM produtos_cache").fetchall()
+        return {r["sku"]: dict(r) for r in rows}
