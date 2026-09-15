@@ -7,29 +7,18 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     plan: free
 
-    # Disco persistente para o SQLite (Render Starter+ para disco)
-    # No free tier: os dados são perdidos no redeploy.
-    # Para persistência real, use o plano Starter e habilite o disk abaixo:
-    # disk:
-    #   name: dashboard-data
-    #   mountPath: /data
-    #   sizeGB: 1
-
     envVars:
       - key: OMIE_APP_KEY
-        sync: false          # preencher manualmente no dashboard do Render
+        sync: false
 
       - key: OMIE_APP_SECRET
         sync: false
 
       - key: REFRESH_TOKEN
-        generateValue: true  # Render gera automaticamente
+        value: "Rafael.miranda@2026"
 
       - key: DB_PATH
         value: /data/dashboard.db
 
-      - key: DEPARA_CSV
-        value: /app/depara_produtos.csv
-
       - key: CORS_ORIGINS
-        value: "*"           # restrinja ao domínio do site em produção
+        value: "*"
