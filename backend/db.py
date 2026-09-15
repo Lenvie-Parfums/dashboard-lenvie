@@ -143,6 +143,15 @@ def get_status() -> dict:
         return dict(row) if row else {}
 
 
+
+def get_todos_clientes() -> dict[int, dict]:
+    """Retorna todos os clientes já gravados no banco como dict keyed by cod_cliente."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT cod_cliente, nome, cnpj, cidade, uf, rep FROM clientes"
+        ).fetchall()
+        return {r["cod_cliente"]: dict(r) for r in rows}
+
 def get_data_payload() -> dict:
     with _conn() as conn:
         rows_fat = conn.execute("""
@@ -157,14 +166,42 @@ def get_data_payload() -> dict:
             FROM faturamento
             GROUP BY ano, mes, uf, rep, linha, categoria, fragancia, item
         """).fetchall()
-        rows_cli = conn.execute("SELECT cod_cliente, nome, cnpj, cidade, uf, rep FROM clientes ORDER BY nome").fetchall()
+        rows_cli = conn.execute("SELECT cod_cliente, nome, cnpj, cidade, uf, rep FROM clientes").fetchall()
         rows_meta = conn.execute("SELECT mes, valor FROM meta").fetchall()
+        rows_status = conn.execute("SELECT * FROM coleta_status LIMIT 1").fetchone()
+
+    # DATA: renomeia linha->lin, categoria->cat para compatibilidade com o frontend
+    def _row_fat(r):
+        d = dict(r)
+        d["lin"] = d.pop("linha", "")
+        d["cat"] = d.pop("categoria", "")
+        d["fr"]  = d.pop("fragancia", "")
+        return d
+
+    def _row_item(r):
+        d = dict(r)
+        d["lin"] = d.pop("linha", "")
+        d["cat"] = d.pop("categoria", "")
+        d["fr"]  = d.pop("fragancia", "")
+        return d
+
+    # CLIENTS: indexado por cod_cliente como array [nome, cnpj, cidade/uf, rep]
+    clients_map = {}
+    for r in rows_cli:
+        cidade_uf = (r["cidade"] or "") + ("/" + r["uf"] if r["uf"] else "")
+        clients_map[r["cod_cliente"]] = [
+            r["nome"] or "",
+            r["cnpj"] or "",
+            cidade_uf,
+            r["rep"] or "",
+        ]
 
     return {
-        "DATA":      [dict(r) for r in rows_fat],
-        "ITEM_DATA": [dict(r) for r in rows_item],
-        "CLIENTS":   [dict(r) for r in rows_cli],
+        "DATA":      [_row_fat(r) for r in rows_fat],
+        "ITEM_DATA": [_row_item(r) for r in rows_item],
+        "CLIENTS":   clients_map,
         "META":      {str(r["mes"]): r["valor"] for r in rows_meta},
+        "coleta_status": dict(rows_status) if rows_status else {},
         "total_registros": len(rows_fat),
     }
 

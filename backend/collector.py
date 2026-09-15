@@ -41,7 +41,7 @@ async def _carregar_vendedores(omie: OmieClient) -> dict[int, str]:
             "ListarVendedores",
             {},
             chave_registros="cadastro",
-            por_pagina=200,
+            por_pagina=100,
         ):
             cod  = v.get("nCodVend") or v.get("codigo")
             nome = v.get("cNome") or v.get("nome") or ""
@@ -53,48 +53,29 @@ async def _carregar_vendedores(omie: OmieClient) -> dict[int, str]:
     return cache
 
 
-async def _carregar_clientes(
+async def _consultar_cliente(
     omie: OmieClient,
+    cod_cliente: int,
     vendedores: dict[int, str],
-) -> dict[int, dict]:
-    cache: dict[int, dict] = {}
-    lote_cli: list[dict] = []
-    log.info("Carregando clientes de forma otimizada...")
-    
-    async for cli in omie.paginate(
-        "geral/clientes/",
-        "ListarClientes",
-        {"clientesFiltro": {}},
-        chave_registros="clientes_cadastro",
-        por_pagina=200,
-    ):
-        cod = cli.get("codigo_cliente_omie")
-        if not cod:
-            continue
-        cod_vend = cli.get("codigo_vendedor") or 0
+) -> dict:
+    """Consulta um único cliente pelo código. Retorna dict com os dados."""
+    try:
+        resp = await omie.call("ConsultarCliente", "geral/clientes/", {
+            "codigo_cliente_omie": cod_cliente,
+        })
+        cod_vend = resp.get("codigo_vendedor") or resp.get("nCodVend") or 0
         rep = vendedores.get(int(cod_vend), "") if cod_vend else ""
-        
-        dado_cli = {
-            "cod_cliente": int(cod),
-            "nome":   (cli.get("razao_social") or "").strip(),
-            "cnpj":   (cli.get("cnpj_cpf") or "").strip(),
-            "cidade": (cli.get("cidade") or "").strip(),
-            "uf":     (cli.get("estado") or "").strip().upper(),
+        return {
+            "cod_cliente": cod_cliente,
+            "nome":   (resp.get("razao_social") or resp.get("nome_fantasia") or "").strip(),
+            "cnpj":   (resp.get("cnpj_cpf") or "").strip(),
+            "cidade": (resp.get("cidade") or "").strip(),
+            "uf":     (resp.get("estado") or "").strip().upper(),
             "rep":    rep,
         }
-        cache[int(cod)] = dado_cli
-        lote_cli.append(dado_cli)
-
-        if len(lote_cli) >= 500:
-            db.upsert_clientes(lote_cli)
-            lote_cli.clear()
-
-    if lote_cli:
-        db.upsert_clientes(lote_cli)
-        lote_cli.clear()
-
-    log.info("Clientes carregados no total: %d", len(cache))
-    return cache
+    except Exception as e:
+        log.warning("Falha ao consultar cliente %d: %s", cod_cliente, e)
+        return {"cod_cliente": cod_cliente, "nome": "", "cnpj": "", "cidade": "", "uf": "", "rep": ""}
 
 
 def _extrair_chave(nf: dict) -> str:
@@ -115,7 +96,7 @@ def _extrair_chave(nf: dict) -> str:
     return ""
 
 
-async def _processar_itens(nf: dict, clientes_cache: dict[int, dict], depara) -> list[dict]:
+async def _processar_itens(nf: dict, clientes_cache: dict[int, dict], depara, omie_ref: list, vendedores_ref: list) -> list[dict]:
     chave_nf = _extrair_chave(nf)
     if not chave_nf:
         return []
@@ -133,6 +114,12 @@ async def _processar_itens(nf: dict, clientes_cache: dict[int, dict], depara) ->
         cod_cliente = int(dest.get("nCodCli") or nf.get("nCodCli") or 0)
     except (ValueError, TypeError):
         cod_cliente = 0
+
+    if cod_cliente and cod_cliente not in clientes_cache:
+        # Cliente novo — consulta Omie e salva no banco e cache
+        cli_novo = await _consultar_cliente(omie_ref[0], cod_cliente, vendedores_ref[0])
+        clientes_cache[cod_cliente] = cli_novo
+        db.upsert_clientes([cli_novo])
 
     cli_info = clientes_cache.get(cod_cliente, {})
     rep = cli_info.get("rep") or "N/D"
@@ -201,8 +188,11 @@ async def coletar(data_ini: str, data_fim: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=60.0) as http:
             omie = await _build_client(http)
-            vendedores     = await _carregar_vendedores(omie)
-            clientes_cache = await _carregar_clientes(omie, vendedores)
+            vendedores = await _carregar_vendedores(omie)
+
+            # Clientes: carrega do banco o que já existe, consulta Omie só os novos
+            clientes_cache: dict[int, dict] = db.get_todos_clientes()
+            log.info("Clientes já no banco: %d", len(clientes_cache))
 
             reset_depara()
             cache_produtos = db.get_todos_produtos_cache()
@@ -216,7 +206,7 @@ async def coletar(data_ini: str, data_fim: str) -> dict:
                 "ListarNF",
                 {"tpNF": "1", "dEmiInicial": data_ini, "dEmiFinal": data_fim},
                 chave_registros="nfCadastro",
-                por_pagina=50,
+                por_pagina=20,
             ):
                 if db.deve_cancelar():
                     log.info("Cancelado pelo usuário em %d NFs", total_nfs)
@@ -230,10 +220,22 @@ async def coletar(data_ini: str, data_fim: str) -> dict:
                     nfs_ignoradas += 1
                     continue
 
-                itens = await _processar_itens(nf, clientes_cache, depara)
+                # ListarNF não retorna os itens (det) — precisa ConsultarNF
+                nid = nf.get("nIdNF") or (nf.get("compl") or {}).get("nIdNF")
+                if nid:
+                    try:
+                        nf_completa = await omie.call("ConsultarNF", "produtos/nfconsultar/", {
+                            "nIdNF": nid,
+                        })
+                        if nf_completa and not nf_completa.get("faultstring"):
+                            nf = nf_completa
+                    except Exception as e:
+                        log.warning("Falha ao consultar NF completa nIdNF=%s: %s", nid, e)
+
+                itens = await _processar_itens(nf, clientes_cache, depara, [omie], [vendedores])
                 lote.extend(itens)
                 
-                if len(lote) >= 300:
+                if len(lote) >= 100:
                     total_registros += db.upsert_faturamento(lote)
                     lote.clear()
 
