@@ -1625,7 +1625,7 @@ function init() {
   document.getElementById("priceDimension").addEventListener("change",()=>{
     if (activeTab === "prices") renderActiveTab();
   });
-  document.getElementById("resetBtn").addEventListener("click",resetAll);
+  const _resetBtn = document.getElementById("resetBtn"); if(_resetBtn) _resetBtn.addEventListener("click",resetAll);
 
   document.querySelectorAll(".tab-btn").forEach(btn=>btn.addEventListener("click",()=>{
     document.querySelectorAll(".tab-btn").forEach(b=>b.classList.remove("active"));
@@ -1972,7 +1972,7 @@ function init() {
   document.getElementById('revenueDimension').addEventListener('change',()=>{ selectedRevenueItem=null; if (activeTab==='revenues') renderActiveTab(); });
   document.getElementById('quantityDimension').addEventListener('change',()=>{ if (activeTab==='quantities') renderActiveTab(); });
   document.getElementById('priceDimension').addEventListener('change',()=>{ if (activeTab==='prices') renderActiveTab(); });
-  document.getElementById('resetBtn').addEventListener('click',resetAll);
+  const _resetBtn2 = document.getElementById('resetBtn'); if(_resetBtn2) _resetBtn2.addEventListener('click',resetAll);
   const clearRevenueItemBtn=document.getElementById('clearRevenueItemBtn'); if (clearRevenueItemBtn) clearRevenueItemBtn.addEventListener('click',()=>{ selectedRevenueItem=null; if (activeTab==='revenues') renderActiveTab(); });
   document.querySelectorAll('.tab-btn').forEach(btn=>btn.addEventListener('click',()=>{ document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active')); document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active')); btn.classList.add('active'); activeTab=btn.dataset.tab; document.getElementById(activeTab).classList.add('active'); renderActiveTab(); }));
   document.querySelectorAll('.table-search').forEach(input=>input.addEventListener('input',()=>{ const tableId=input.dataset.table,t=currentTables[tableId]; if (!t) return; const query=input.value.toLowerCase(); fillTable(tableId,t.rows.filter(r=>Object.values(r).some(v=>typeof v==='string'&&v.toLowerCase().includes(query))),t.columns); }));
@@ -2465,7 +2465,7 @@ function init() {
     if (activeTab === "prices") renderActiveTab();
   });
 
-  document.getElementById("resetBtn").addEventListener("click",resetAll);
+  const _resetBtn = document.getElementById("resetBtn"); if(_resetBtn) _resetBtn.addEventListener("click",resetAll);
 
   document.querySelectorAll(".tab-btn").forEach(btn=>btn.addEventListener("click",()=>{
     document.querySelectorAll(".tab-btn").forEach(b=>b.classList.remove("active"));
