@@ -724,6 +724,7 @@ footer {
 
       <div class="actions">
       <button class="btn-primary" onclick="disparaRefresh()" id="btnAtualizar">🔄 Atualizar dados</button>
+      <button class="btn-secondary" onclick="cancelarColeta()" id="btnCancelar" style="display:none">⏹ Cancelar</button>
       <span id="refreshStatus" style="font-size:14px;color:var(--cream)"></span>
       <span class="filter-status" id="filterStatus"></span>
       <span id="ultimaColeta" style="font-size:13px;color:var(--soft);margin-left:auto"></span>
@@ -915,7 +916,7 @@ footer {
 <script>
 /* ── CONFIGURAÇÃO ─────────────────────────────────────────────────── */
 const API_BASE   = "https://dashboard-lenvie-comercial.onrender.com";  // ajuste após deploy
-const REFRESH_TOKEN = "";   // deixe vazio se o botão ficar em URL interna; ou coloque o token
+const REFRESH_TOKEN = "Rafael.miranda@2026";   // deixe vazio se o botão ficar em URL interna; ou coloque o token
 
 /* ── ESTADO GLOBAL ────────────────────────────────────────────────── */
 let DATA = [];
@@ -967,6 +968,8 @@ async function disparaRefresh() {
   btn.disabled = true;
   btn.textContent = "⏳ Aguarde...";
   statusEl.textContent = "";
+  const btnCa = document.getElementById("btnCancelar");
+  if (btnCa) btnCa.style.display = "inline-block";
 
   try {
     const headers = { "Content-Type": "application/json" };
@@ -1002,6 +1005,7 @@ async function aguardarERecarregar(tentativas = 0) {
   try {
     const resp = await fetch(API_BASE + "/status");
     const st = await resp.json();
+    const _bCa = document.getElementById("btnCancelar"); if (_bCa) _bCa.style.display = st.em_andamento ? "inline-block" : "none";
     if (!st.em_andamento) {
       document.getElementById("refreshStatus").textContent =
         "✅ Coleta concluída! Recarregando dados...";
@@ -1011,6 +1015,24 @@ async function aguardarERecarregar(tentativas = 0) {
     }
   } catch (_) {
     aguardarERecarregar(tentativas + 1);
+  }
+}
+
+/* ── CANCELAR COLETA ─────────────────────────────────────────────── */
+async function cancelarColeta() {
+  const btn = document.getElementById("btnCancelar");
+  const statusEl = document.getElementById("refreshStatus");
+  if (btn) btn.disabled = true;
+  try {
+    const headers = {"Content-Type": "application/json"};
+    if (REFRESH_TOKEN) headers["Authorization"] = "Bearer " + REFRESH_TOKEN;
+    const resp = await fetch(API_BASE + "/cancel", {method: "POST", headers});
+    const data = await resp.json();
+    if (statusEl) statusEl.textContent = data.mensagem || "Cancelamento solicitado.";
+  } catch(e) {
+    if (statusEl) statusEl.textContent = "Erro ao cancelar: " + e.message;
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
