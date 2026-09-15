@@ -222,15 +222,19 @@ async def coletar(data_ini: str, data_fim: str) -> dict:
 
                 # ListarNF não retorna os itens (det) — precisa ConsultarNF
                 nid = nf.get("nIdNF") or (nf.get("compl") or {}).get("nIdNF")
-                if nid:
+                cChaveNFe = (nf.get("compl") or {}).get("cChaveNFe") or nf.get("cChaveNFe") or ""
+                if nid or cChaveNFe:
                     try:
-                        nf_completa = await omie.call("ConsultarNF", "produtos/nfconsultar/", {
-                            "nIdNF": nid,
-                        })
+                        param_consulta = {}
+                        if cChaveNFe:
+                            param_consulta["cChaveNFe"] = cChaveNFe
+                        elif nid:
+                            param_consulta["nIdNF"] = int(nid)
+                        nf_completa = await omie.call("ConsultarNF", "produtos/nfconsultar/", param_consulta)
                         if nf_completa and not nf_completa.get("faultstring"):
                             nf = nf_completa
                     except Exception as e:
-                        log.warning("Falha ao consultar NF completa nIdNF=%s: %s", nid, e)
+                        log.warning("Falha ao consultar NF completa nIdNF=%s chave=%s: %s", nid, cChaveNFe, e)
 
                 itens = await _processar_itens(nf, clientes_cache, depara, [omie], [vendedores])
                 lote.extend(itens)

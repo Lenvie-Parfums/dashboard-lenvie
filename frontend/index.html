@@ -713,7 +713,12 @@ footer {
     <span class="badge">Base atualizada</span>
   </div>
 
-  <div class="filters">
+  <div class="filters" style="grid-template-columns:repeat(7,minmax(130px,1fr));">
+    <div class="filter"><label>Ano</label><select id="fAno" onchange="atualizarDashboard && atualizarDashboard()">
+      <option value="ALL">Todos</option>
+      <option value="2025">2025</option>
+      <option value="2026" selected>2026</option>
+    </select></div>
     <div class="filter"><label>Mês inicial</label><select id="mStart"></select></div>
     <div class="filter"><label>Mês final</label><select id="mEnd"></select></div>
     <div class="filter"><label>Estado (UF)</label><select id="fUf"></select></div>
@@ -723,6 +728,9 @@ footer {
   </div>
 
       <div class="actions">
+      <button class="btn-primary" onclick="mostrarTodos()">Exibir todos os dados</button>
+      <button class="btn-secondary" onclick="window.print()">Imprimir / Salvar PDF</button>
+      <button class="btn-secondary" onclick="exportarTabela()">Exportar tabela ativa</button>
       <button class="btn-primary" onclick="disparaRefresh()" id="btnAtualizar">🔄 Atualizar dados</button>
       <span id="refreshStatus" style="font-size:14px;color:var(--cream)"></span>
       <span class="filter-status" id="filterStatus"></span>
@@ -1022,6 +1030,42 @@ async function aguardarERecarregar(tentativas = 0) {
 
 /* ── INICIA ───────────────────────────────────────────────────────── */
 document.addEventListener("DOMContentLoaded", carregarDados);
+
+// ── BOTÕES DE AÇÃO ────────────────────────────────────────────────
+function mostrarTodos() {
+  document.getElementById("mStart").value = "1";
+  document.getElementById("mEnd").value   = "12";
+  const fAno = document.getElementById("fAno");
+  if (fAno) fAno.value = "ALL";
+  ["fUf","fRep","fLin","fCat"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = "ALL";
+  });
+  atualizarDashboard();
+}
+
+function exportarTabela() {
+  const tabelas = document.querySelectorAll("table");
+  let tabela = null;
+  tabelas.forEach(t => {
+    if (t.offsetParent !== null) tabela = t;
+  });
+  if (!tabela) { alert("Nenhuma tabela visível para exportar."); return; }
+  let csv = "";
+  tabela.querySelectorAll("tr").forEach(tr => {
+    const cols = Array.from(tr.querySelectorAll("th,td")).map(td =>
+      '"' + (td.innerText || "").replace(/"/g, '""').replace(/
+/g, " ") + '"'
+    );
+    csv += cols.join(";") + "
+";
+  });
+  const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href = url;
+  a.download = "tabela-lenvie-" + new Date().toISOString().slice(0,10) + ".csv";
+  a.click(); URL.revokeObjectURL(url);
+}
 </script>
 
 <script>
@@ -1085,8 +1129,10 @@ function filterData(excludeId=null) {
   const m2 = Number(selected("mEnd"));
   const minM = Math.min(m1,m2);
   const maxM = Math.max(m1,m2);
+  const ano = selected("fAno");
 
   return DATA.filter(d=>{
+    if (ano !== "ALL" && String(d.y) !== String(ano)) return false;
     if (d.m < minM || d.m > maxM) return false;
     for (const [id,key] of Object.entries(DIMS)) {
       if (id === excludeId) continue;
