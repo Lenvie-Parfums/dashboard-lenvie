@@ -714,7 +714,7 @@ footer {
   </div>
 
   <div class="filters" style="grid-template-columns:repeat(7,minmax(130px,1fr));">
-    <div class="filter"><label>Ano</label><select id="fAno" onchange="atualizarDashboard && atualizarDashboard()">
+    <div class="filter"><label>Ano</label><select id="fAno" onchange="updateDashboard()">
       <option value="ALL">Todos</option>
       <option value="2025">2025</option>
       <option value="2026" selected>2026</option>
@@ -923,7 +923,7 @@ footer {
 <script>
 /* ── CONFIGURAÇÃO ─────────────────────────────────────────────────── */
 const API_BASE   = "";  // caminho relativo — funciona em qualquer domínio
-const REFRESH_TOKEN = "";   // deixe vazio se o botão ficar em URL interna; ou coloque o token
+const REFRESH_TOKEN = "Rafael.miranda@2026";
 
 /* ── ESTADO GLOBAL ────────────────────────────────────────────────── */
 let DATA = [];
@@ -978,13 +978,13 @@ async function disparaRefresh() {
 
   try {
     const headers = { "Content-Type": "application/json" };
-    // token via prompt guardado no localStorage
-let _savedToken = localStorage.getItem("refresh_token") || "";
-if (!_savedToken) {
-  _savedToken = prompt("Token de atualização (TI):", "") || "";
-  if (_savedToken) localStorage.setItem("refresh_token", _savedToken);
-}
-if (_savedToken) headers["x-refresh-token"] = _savedToken;
+    let _savedToken = localStorage.getItem("refresh_token") || REFRESH_TOKEN || "";
+    if (!_savedToken) {
+      _savedToken = prompt("Token de atualização (TI):", "") || "";
+      if (_savedToken) localStorage.setItem("refresh_token", _savedToken);
+    }
+    if (!_savedToken) { alert("Token não informado."); btn.disabled = false; btn.textContent = "🔄 Atualizar dados"; return; }
+    headers["x-refresh-token"] = _savedToken;
 
     const resp = await fetch(API_BASE + "/refresh", {
       method: "POST",
@@ -1041,7 +1041,7 @@ function mostrarTodos() {
     const el = document.getElementById(id);
     if (el) el.value = "ALL";
   });
-  atualizarDashboard();
+  updateDashboard();
 }
 
 function exportarTabela() {
@@ -1963,12 +1963,12 @@ function renderActiveTab() {
   if (activeTab==='clients') { const arr=aggregateClients(rows); renderClientKpis(arr); renderClientChart(arr); renderTable('tableClients',arr,['Rank','Item','Document','City','UF','Representative','Fat25','Fat26','VarFat','GrowthFat','Share25','Share26','CumShare26','Qtd25','Qtd26','VarQtd','GrowthQtd','Price25','Price26','Months25','Months26','LastMonth25','LastMonth26','AvgMonth25','AvgMonth26','Status']); }
 }
 function resetAll() {
-  initMonths(); for (const [id,key] of Object.entries(DIMS)) { setOptions(id,DATA.map(d=>d[key]),false); document.getElementById(id).value='ALL'; }
+  initMonths(); for (const [id,key] of Object.entries(DIMS)) { if(typeof DATA!=='undefined'&&DATA.length>0){setOptions(id,DATA.map(d=>d[key]),false);} const el=document.getElementById(id); if(el) el.value='ALL'; }
   selectedRevenueItem=null; document.getElementById('revenueDimension').value='lin'; document.getElementById('quantityDimension').value='cat'; document.getElementById('priceDimension').value='cat'; updateDashboard();
 }
 function init() {
-  initMonths(); for (const [id,key] of Object.entries(DIMS)) { setOptions(id,DATA.map(d=>d[key]),false); document.getElementById(id).value='ALL'; }
-  ['mStart','mEnd',...Object.keys(DIMS)].forEach(id=>document.getElementById(id).addEventListener('change',updateDashboard));
+  initMonths(); for (const [id,key] of Object.entries(DIMS)) { if(typeof DATA!=='undefined'&&DATA.length>0){setOptions(id,DATA.map(d=>d[key]),false);} const el=document.getElementById(id); if(el) el.value='ALL'; }
+  ['mStart','mEnd',...Object.keys(DIMS)].forEach(id=>{ const el=document.getElementById(id); if(el) el.addEventListener('change',updateDashboard); });
   document.getElementById('revenueDimension').addEventListener('change',()=>{ selectedRevenueItem=null; if (activeTab==='revenues') renderActiveTab(); });
   document.getElementById('quantityDimension').addEventListener('change',()=>{ if (activeTab==='quantities') renderActiveTab(); });
   document.getElementById('priceDimension').addEventListener('change',()=>{ if (activeTab==='prices') renderActiveTab(); });
