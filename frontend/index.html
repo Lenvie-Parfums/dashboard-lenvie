@@ -1618,11 +1618,11 @@ function init() {
     document.getElementById(id).addEventListener("change",updateDashboard);
   });
 
-  document.getElementById("quantityDimension").addEventListener("change",()=>{
+  document.getElementById("quantityDimension")?.addEventListener("change",()=>{
     selectedQuantityItem = null;
     if (activeTab === "quantities") renderActiveTab();
   });
-  document.getElementById("priceDimension").addEventListener("change",()=>{
+  document.getElementById("priceDimension")?.addEventListener("change",()=>{
     if (activeTab === "prices") renderActiveTab();
   });
   const _resetBtn = document.getElementById("resetBtn"); if(_resetBtn) _resetBtn.addEventListener("click",resetAll);
@@ -1644,7 +1644,7 @@ function init() {
     fillTable(tableId,t.rows.filter(r=>String(r.Item).toLowerCase().includes(query)),t.columns);
   }));
 
-  document.getElementById("csvBtn").addEventListener("click",()=>{
+  document.getElementById("csvBtn")?.addEventListener("click",()=>{
     const map = {
       ufrank:"tableUfRank",ufgrowth:"tableUfGrowth",
       reprank:"tableRepRank",repgrowth:"tableRepGrowth",
@@ -1969,14 +1969,14 @@ function resetAll() {
 function init() {
   initMonths(); for (const [id,key] of Object.entries(DIMS)) { if(typeof DATA!=='undefined'&&DATA.length>0){setOptions(id,DATA.map(d=>d[key]),false);} const el=document.getElementById(id); if(el) el.value='ALL'; }
   ['mStart','mEnd',...Object.keys(DIMS)].forEach(id=>{ const el=document.getElementById(id); if(el) el.addEventListener('change',updateDashboard); });
-  document.getElementById('revenueDimension').addEventListener('change',()=>{ selectedRevenueItem=null; if (activeTab==='revenues') renderActiveTab(); });
-  document.getElementById('quantityDimension').addEventListener('change',()=>{ if (activeTab==='quantities') renderActiveTab(); });
-  document.getElementById('priceDimension').addEventListener('change',()=>{ if (activeTab==='prices') renderActiveTab(); });
+  document.getElementById('revenueDimension')?.addEventListener('change',()=>{ selectedRevenueItem=null; if (activeTab==='revenues') renderActiveTab(); });
+  document.getElementById('quantityDimension')?.addEventListener('change',()=>{ if (activeTab==='quantities') renderActiveTab(); });
+  document.getElementById('priceDimension')?.addEventListener('change',()=>{ if (activeTab==='prices') renderActiveTab(); });
   const _resetBtn2 = document.getElementById('resetBtn'); if(_resetBtn2) _resetBtn2.addEventListener('click',resetAll);
   const clearRevenueItemBtn=document.getElementById('clearRevenueItemBtn'); if (clearRevenueItemBtn) clearRevenueItemBtn.addEventListener('click',()=>{ selectedRevenueItem=null; if (activeTab==='revenues') renderActiveTab(); });
   document.querySelectorAll('.tab-btn').forEach(btn=>btn.addEventListener('click',()=>{ document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active')); document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active')); btn.classList.add('active'); activeTab=btn.dataset.tab; document.getElementById(activeTab).classList.add('active'); renderActiveTab(); }));
   document.querySelectorAll('.table-search').forEach(input=>input.addEventListener('input',()=>{ const tableId=input.dataset.table,t=currentTables[tableId]; if (!t) return; const query=input.value.toLowerCase(); fillTable(tableId,t.rows.filter(r=>Object.values(r).some(v=>typeof v==='string'&&v.toLowerCase().includes(query))),t.columns); }));
-  document.getElementById('csvBtn').addEventListener('click',()=>{ const map={ufrank:'tableUfRank',ufgrowth:'tableUfGrowth',reprank:'tableRepRank',repgrowth:'tableRepGrowth',revenues:'tableRevenue',quantities:'tableQuantities',prices:'tablePrices',clients:'tableClients'},tableId=map[activeTab]; if (!tableId) { alert('Abra uma aba com tabela para exportar.'); return; } const t=currentTables[tableId]; if (!t||!t.rows.length) { alert('Não há dados para exportar.'); return; } const headers=t.columns.map(c=>columnLabel(tableId,c)).join(';'),lines=t.rows.map(r=>t.columns.map(c=>{ const v=r[c]; if (typeof v==='number') return String(v).replace('.',','); return `"${String(v??'').replaceAll('"','""')}"`; }).join(';')); const blob=new Blob(['\ufeff'+[headers,...lines].join('\n')],{type:'text/csv;charset=utf-8'}),a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=tableId+'.csv'; a.click(); URL.revokeObjectURL(a.href); });
+  document.getElementById('csvBtn')?.addEventListener('click',()=>{ const map={ufrank:'tableUfRank',ufgrowth:'tableUfGrowth',reprank:'tableRepRank',repgrowth:'tableRepGrowth',revenues:'tableRevenue',quantities:'tableQuantities',prices:'tablePrices',clients:'tableClients'},tableId=map[activeTab]; if (!tableId) { alert('Abra uma aba com tabela para exportar.'); return; } const t=currentTables[tableId]; if (!t||!t.rows.length) { alert('Não há dados para exportar.'); return; } const headers=t.columns.map(c=>columnLabel(tableId,c)).join(';'),lines=t.rows.map(r=>t.columns.map(c=>{ const v=r[c]; if (typeof v==='number') return String(v).replace('.',','); return `"${String(v??'').replaceAll('"','""')}"`; }).join(';')); const blob=new Blob(['\ufeff'+[headers,...lines].join('\n')],{type:'text/csv;charset=utf-8'}),a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=tableId+'.csv'; a.click(); URL.revokeObjectURL(a.href); });
   updateDashboard();
 }
 
@@ -2399,16 +2399,17 @@ function init() {
 
   for (const [id,key] of Object.entries(REVENUE_LOCAL_DIMS)) {
     const el = document.getElementById(id);
-    if (el) setOptions(id,DATA.map(d=>d[key]),false,"Todas");
+    if (el && typeof DATA !== "undefined" && DATA.length > 0) setOptions(id,DATA.map(d=>d[key]),false,"Todas");
   }
 
   for (const [id,key] of Object.entries(QUANTITY_LOCAL_DIMS)) {
     const el = document.getElementById(id);
-    if (el) setOptions(id,DATA.map(d=>d[key]),false,"Todas");
+    if (el && typeof DATA !== "undefined" && DATA.length > 0) setOptions(id,DATA.map(d=>d[key]),false,"Todas");
   }
 
   ["mStart","mEnd",...Object.keys(DIMS)].forEach(id=>{
-    document.getElementById(id).addEventListener("change",()=>{
+    const _el = document.getElementById(id);
+    if (_el) _el.addEventListener("change",()=>{
       selectedRevenueItem = null;
       selectedQuantityItem = null;
       updateDashboard();
@@ -2457,11 +2458,11 @@ function init() {
     });
   }
 
-  document.getElementById("quantityDimension").addEventListener("change",()=>{
+  document.getElementById("quantityDimension")?.addEventListener("change",()=>{
     if (activeTab === "quantities") renderActiveTab();
   });
 
-  document.getElementById("priceDimension").addEventListener("change",()=>{
+  document.getElementById("priceDimension")?.addEventListener("change",()=>{
     if (activeTab === "prices") renderActiveTab();
   });
 
@@ -2485,7 +2486,7 @@ function init() {
     fillTable(tableId,t.rows.filter(r=>Object.values(r).some(v=>typeof v === "string" && v.toLowerCase().includes(query))),t.columns);
   }));
 
-  document.getElementById("csvBtn").addEventListener("click",()=>{
+  document.getElementById("csvBtn")?.addEventListener("click",()=>{
     const map = {
       ufrank:"tableUfRank",
       ufgrowth:"tableUfGrowth",

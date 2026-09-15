@@ -1,67 +1,117 @@
 from __future__ import annotations
+import re
 import logging
 
 log = logging.getLogger("depara")
 
-# Campos candidatos no retorno do ConsultarProduto do Omie para linha/categoria.
-# Ajustados a partir do diagnóstico real do endpoint geral/produtos/.
-CAMPOS_LINHA = ["familia_produto", "descricao_familia", "linha_produto", "linha"]
-CAMPOS_CATEGORIA = ["categoria", "descricao_categoria", "tipo_item"]
+# Mapeamento de categoria baseado na descrição do produto
+# Padrão da descrição: "CATEGORIA FRAGÂNCIA - LINHA - VOLUME"
+# Ex: "AGUA PERFUMADA FIGO AMBARADO - ARABESC - 500ML"
+#     "DIFUSOR DE PERFUME FIGO - ARABESC - 200ML"
+#     "VELA PERFUMADA INTO THE NIGHT - CLASSIC - 210G"
+
+CATEGORIAS_CONHECIDAS = [
+    "AGUA PERFUMADA",
+    "AGUA SPLASH",
+    "DIFUSOR DE PERFUME",
+    "HOME SPRAY",
+    "SABONETE LIQUIDO",
+    "SABONETE EM BARRA",
+    "OLEO CONCENTRADO",
+    "REFIL DIFUSOR",
+    "REFIL SAB",
+    "VELA PERF",
+    "VELA PERFUMADA",
+    "BODY MIST",
+    "BODY CREAM",
+    "CREME DE MAO",
+    "BARRA DE CERA",
+    "KIT",
+    "EDP",
+    "PERFUMES",
+    "CORPO",
+    "ACESSORIOS",
+    "ACESSÓRIOS",
+]
+
+CATEGORIA_NORMALIZADA = {
+    "VELA PERF": "VELA",
+    "VELA PERFUMADA": "VELA",
+    "REFIL SAB": "REFIL SAB",
+    "SABONETE EM BARRA": "SABONETE EM BARRA",
+    "BODY MIST": "CORPO",
+    "BODY CREAM": "CORPO",
+    "CREME DE MAO": "CORPO",
+    "EDP": "PERFUMES",
+}
+
+
+def extrair_linha_categoria(descricao: str) -> tuple[str, str]:
+    """
+    Extrai linha e categoria da descrição do produto.
+    Padrão: "CATEGORIA FRAGANCIA - LINHA - VOLUME"
+    Ex: "AGUA PERFUMADA FIGO AMBARADO - ARABESC - 500ML"
+      → linha="ARABESC", categoria="AGUA PERFUMADA"
+    """
+    if not descricao:
+        return ("Outros", "Outros")
+
+    desc = descricao.strip().upper()
+    partes = [p.strip() for p in desc.split(" - ")]
+
+    # Linha = segundo segmento (índice 1)
+    linha = "Outros"
+    if len(partes) >= 2:
+        linha = partes[1].strip()
+        # Remove volume se ficou junto (ex: "ARABESC 500ML")
+        linha = re.sub(r'\s+\d+.*$', '', linha).strip()
+        if not linha:
+            linha = "Outros"
+
+    # Categoria = extraída do primeiro segmento
+    categoria = "Outros"
+    primeiro = partes[0] if partes else ""
+    for cat in sorted(CATEGORIAS_CONHECIDAS, key=len, reverse=True):
+        if primeiro.startswith(cat):
+            categoria = CATEGORIA_NORMALIZADA.get(cat, cat)
+            break
+
+    return (linha, categoria)
 
 
 class DeparaResolver:
     """
-    Resolve linha/categoria de um item de nota fiscal a partir do SKU (código do produto).
+    Resolve linha/categoria de um item de NF a partir da descrição do produto.
 
     Ordem de resolução:
       1. Cache em memória (carregado do banco no início da coleta)
-      2. Consulta direta à API do Omie (ConsultarProduto) — resultado salvo no cache
-      3. Se a API não retornar nada utilizável, usa "Outros" (nunca usa CSV nem
-         inferência por palavra-chave na descrição)
+      2. Extração da descrição (padrão: CATEGORIA - LINHA - VOLUME)
+      3. Salva no cache para não repetir
     """
 
     def __init__(self, omie_client=None, cache_inicial: dict[str, dict] | None = None):
-        self.omie = omie_client
+        self.omie = omie_client  # mantido por compatibilidade, não usado
         self.cache: dict[str, dict] = dict(cache_inicial or {})
         self.pendentes_gravar: dict[str, dict] = {}
 
     async def resolver_async(self, sku: str, descricao: str) -> tuple[str, str]:
         sku = (sku or "").strip()
-        if not sku:
-            return ("Outros", "Outros")
 
-        if sku in self.cache:
+        # 1. Cache em memória
+        if sku and sku in self.cache:
             info = self.cache[sku]
             return (info.get("linha") or "Outros", info.get("categoria") or "Outros")
 
-        if self.omie is None:
-            return ("Outros", "Outros")
+        # 2. Extrair da descrição
+        linha, categoria = extrair_linha_categoria(descricao)
 
-        try:
-            resp = await self.omie.call("ConsultarProduto", "geral/produtos/", {
-                "codigo_produto_integracao": "",
-                "codigo": sku,
-            })
-        except Exception as e:
-            log.warning("Falha ao consultar produto %s no Omie: %s", sku, e)
-            return ("Outros", "Outros")
-
-        linha = self._primeiro_campo(resp, CAMPOS_LINHA) or "Outros"
-        categoria = self._primeiro_campo(resp, CAMPOS_CATEGORIA) or "Outros"
-
-        info = {"descricao": descricao, "linha": linha, "categoria": categoria}
-        self.cache[sku] = info
-        self.pendentes_gravar[sku] = info
+        # 3. Salvar no cache
+        if sku:
+            info = {"descricao": descricao, "linha": linha, "categoria": categoria}
+            self.cache[sku] = info
+            self.pendentes_gravar[sku] = info
 
         return (linha, categoria)
-
-    @staticmethod
-    def _primeiro_campo(resp: dict, campos: list[str]) -> str | None:
-        for campo in campos:
-            valor = resp.get(campo)
-            if valor:
-                return str(valor).strip().upper()
-        return None
 
 
 _instancia: DeparaResolver | None = None
@@ -75,6 +125,5 @@ def get_depara(omie_client=None, cache_inicial: dict[str, dict] | None = None) -
 
 
 def reset_depara() -> None:
-    """Usado no início de cada coleta para recarregar o cache do banco."""
     global _instancia
     _instancia = None
