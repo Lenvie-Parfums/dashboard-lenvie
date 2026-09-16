@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 
 from app.sheets.client import SheetsClient
 from app.omie.client import OmieClient
@@ -1435,3 +1436,25 @@ def dashboard_executive_kpis(
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+# ============================================================
+# FRONTEND V10
+# ============================================================
+
+@app.get("/dashboard", include_in_schema=False)
+def dashboard_frontend():
+    """Entrega o dashboard HTML V10 sem alterar os endpoints da API."""
+    from pathlib import Path
+
+    index_path = Path(__file__).resolve().parent.parent / "static" / "index.html"
+
+    if not index_path.exists():
+        return {
+            "status": "error",
+            "error": "Frontend não encontrado.",
+            "arquivo_esperado": "static/index.html",
+        }
+
+    return FileResponse(index_path, media_type="text/html")
+
