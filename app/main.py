@@ -504,18 +504,7 @@ def build_base_test():
                 "error": "A aba OMIE_NF está vazia. Execute primeiro a carga controlada.",
             }
 
-        CFOPS_VENDA = {
-    "5101",
-    "6101",
-    "5102",
-    "6102",
-    "5910",
-    "6910",
-    "5403",
-    "6403",
-    "6109",
-    "6110",
-}
+        CFOPS_VENDA =   CFOPS_VENDA = { "5101","6101","5102","6102","5910","6910","5403","6403","6109","6110", }
         CFOPS_EXCLUIR = set()
 
         def to_float(value):
@@ -714,6 +703,205 @@ def build_base_test():
 
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+
+# ============================================================
+# TESTE CONTROLADO DE PEDIDOS OMIE
+# ============================================================
+
+@app.get("/omie/pedidos/load-test")
+def load_test_pedidos():
+    """
+    Carga controlada de pedidos de 01/08/2026 a 03/08/2026.
+
+    Grava somente na aba OMIE_PEDIDOS_TESTE.
+    Não altera OMIE_NF, BASE_VENDAS ou KPIs.
+    """
+    try:
+        omie = get_omie_client()
+        sheets = get_sheets_client()
+
+        data_inicial = "01/08/2026"
+        data_final = "03/08/2026"
+
+        todos_pedidos = []
+        pagina = 1
+        total_paginas = 1
+
+        while pagina <= total_paginas:
+            resposta = omie.call(
+                endpoint=ENDPOINTS["pedidos"],
+                call="ListarPedidos",
+                param={
+                    "pagina": pagina,
+                    "registros_por_pagina": 100,
+                    "filtrar_por_data_de": data_inicial,
+                    "filtrar_por_data_ate": data_final,
+                },
+            )
+
+            pedidos = (
+                resposta.get("pedido_venda_produto")
+                or resposta.get("pedidos")
+                or resposta.get("pedidoVendaProduto")
+                or []
+            )
+
+            todos_pedidos.extend(pedidos)
+
+            total_paginas = int(
+                resposta.get("total_de_paginas")
+                or resposta.get("total_paginas")
+                or 1
+            )
+
+            pagina += 1
+
+        rows = []
+
+        for pedido in todos_pedidos:
+            cab = pedido.get("cabecalho") or {}
+            info = (
+                pedido.get("infoCadastro")
+                or pedido.get("info_cadastro")
+                or {}
+            )
+            total = (
+                pedido.get("total_pedido")
+                or pedido.get("totalPedido")
+                or {}
+            )
+
+            codigo_pedido = (
+                cab.get("codigo_pedido")
+                or cab.get("codigo_pedido_omie")
+                or ""
+            )
+
+            numero_pedido = cab.get("numero_pedido") or ""
+            codigo_cliente = cab.get("codigo_cliente") or ""
+            codigo_vendedor = cab.get("codigo_vendedor") or ""
+
+            codigo_categoria = (
+                cab.get("codigo_categoria")
+                or cab.get("categoria")
+                or ""
+            )
+
+            etapa = cab.get("etapa") or ""
+
+            status = (
+                cab.get("status_pedido")
+                or cab.get("status")
+                or ""
+            )
+
+            data_pedido = (
+                cab.get("data_previsao")
+                or cab.get("data_pedido")
+                or info.get("dInc")
+                or ""
+            )
+
+            valor_pedido = (
+                total.get("valor_total_pedido")
+                or total.get("valor_total")
+                or total.get("total_valor")
+                or 0
+            )
+
+            # Guardamos somente os nomes dos campos para diagnóstico,
+            # evitando JSON bruto grande em uma célula do Sheets.
+            campos_raiz = ";".join(sorted(pedido.keys()))
+            campos_cabecalho = ";".join(sorted(cab.keys()))
+
+            rows.append([
+                codigo_pedido,
+                numero_pedido,
+                data_pedido,
+                codigo_cliente,
+                codigo_vendedor,
+                codigo_categoria,
+                etapa,
+                status,
+                valor_pedido,
+                campos_raiz,
+                campos_cabecalho,
+            ])
+
+        headers = [
+            "COD_PEDIDO",
+            "NUM_PEDIDO",
+            "DATA_PEDIDO",
+            "COD_CLIENTE",
+            "COD_VENDEDOR",
+            "CATEGORIA",
+            "ETAPA",
+            "STATUS",
+            "VALOR_PEDIDO",
+            "CAMPOS_RAIZ",
+            "CAMPOS_CABECALHO",
+        ]
+
+        get_or_create_sheet(sheets, "OMIE_PEDIDOS_TESTE")
+
+        (
+            sheets.api
+            .spreadsheets()
+            .values()
+            .clear(
+                spreadsheetId=sheets.spreadsheet_id,
+                range="'OMIE_PEDIDOS_TESTE'!A:K",
+                body={},
+            )
+            .execute()
+        )
+
+        (
+            sheets.api
+            .spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=sheets.spreadsheet_id,
+                range="'OMIE_PEDIDOS_TESTE'!A1",
+                valueInputOption="RAW",
+                body={"values": [headers] + rows},
+            )
+            .execute()
+        )
+
+        categorias = sorted({
+            str(row[5])
+            for row in rows
+            if row[5] not in (None, "")
+        })
+
+        vendedores = sorted({
+            str(row[4])
+            for row in rows
+            if row[4] not in (None, "")
+        })
+
+        return {
+            "status": "ok",
+            "message": "Carga controlada de pedidos realizada.",
+            "periodo": {
+                "inicio": data_inicial,
+                "fim": data_final,
+            },
+            "pedidos_recebidos": len(todos_pedidos),
+            "pedidos_gravados": len(rows),
+            "categorias_encontradas": categorias,
+            "vendedores_encontrados": len(vendedores),
+            "aba_destino": "OMIE_PEDIDOS_TESTE",
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+        }
 
 
 # ============================================================
