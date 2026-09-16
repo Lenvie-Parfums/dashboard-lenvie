@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: lenvie-commercial-kpis-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: APP_KEY_OMIE
+        sync: false
+      - key: APP_SECRET_OMIE
+        sync: false
+      - key: GOOGLE_SPREADSHEET_ID
+        sync: false
+      - key: GOOGLE_SA_JSON
+        sync: false
+      - key: ADMIN_TOKEN
+        generateValue: true
+  - type: cron
+    name: lenvie-commercial-kpis-sync
+    runtime: python
+    schedule: "0 9 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m jobs.sync
+    envVars:
+      - key: APP_KEY_OMIE
+        sync: false
+      - key: APP_SECRET_OMIE
+        sync: false
+      - key: GOOGLE_SPREADSHEET_ID
+        sync: false
+      - key: GOOGLE_SA_JSON
+        sync: false
