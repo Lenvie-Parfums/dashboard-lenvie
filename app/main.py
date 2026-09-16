@@ -483,6 +483,123 @@ def load_test_nfe():
 # OMIE_NF -> BASE_VENDAS
 # ============================================================
 
+
+# ============================================================
+# REPARO CONTROLADO DA ESTRUTURA DA BASE_VENDAS
+# ============================================================
+
+@app.post("/admin/repair-base-vendas")
+def repair_base_vendas(confirmar: str = ""):
+    """
+    Repara SOMENTE a aba BASE_VENDAS:
+    1) cria backup da estrutura/dados atuais em BASE_VENDAS_BACKUP;
+    2) limpa BASE_VENDAS;
+    3) recria exatamente o contrato A:AE.
+    Não chama Omie e não altera outras abas.
+    """
+    try:
+        if confirmar != "SIM":
+            return {
+                "status": "blocked",
+                "message": "Operação não executada. Use ?confirmar=SIM para confirmar o reparo.",
+            }
+
+        sheets = get_sheets_client()
+
+        headers = [
+            "COMPETENCIA",
+            "DATA_EMISSAO",
+            "ID_NF",
+            "CHAVE_NFE",
+            "NUM_NF",
+            "SERIE",
+            "ID_PEDIDO",
+            "NUM_PEDIDO",
+            "COD_CLIENTE",
+            "CNPJ_CPF",
+            "CLIENTE_NOME",
+            "COD_VENDEDOR",
+            "REP_ID",
+            "REPRESENTANTE",
+            "CATEGORIA",
+            "VALOR_NF",
+            "VALOR_COMERCIAL",
+            "VALOR_EXCLUIDO",
+            "VALOR_PENDENTE",
+            "TIPO_NF",
+            "CFOPS",
+            "CFOPS_VENDA",
+            "CFOPS_EXCLUIDOS",
+            "CFOPS_PENDENTES",
+            "QTD_ITENS",
+            "ITENS_VENDA",
+            "ITENS_EXCLUIDOS",
+            "ITENS_PENDENTES",
+            "QTD_SKUS",
+            "VENDA_VALIDA",
+            "MOTIVO",
+        ]
+
+        get_or_create_sheet(sheets, "BASE_VENDAS")
+        get_or_create_sheet(sheets, "BASE_VENDAS_BACKUP")
+
+        atual = sheets.get("BASE_VENDAS!A1:AE50000")
+
+        # Backup antes de qualquer alteração.
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'BASE_VENDAS_BACKUP'!A:AE",
+            body={},
+        ).execute()
+
+        if atual:
+            sheets.api.spreadsheets().values().update(
+                spreadsheetId=sheets.spreadsheet_id,
+                range="'BASE_VENDAS_BACKUP'!A1",
+                valueInputOption="RAW",
+                body={"values": atual},
+            ).execute()
+
+        # Só depois do backup limpa a aba operacional.
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'BASE_VENDAS'!A:AE",
+            body={},
+        ).execute()
+
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'BASE_VENDAS'!A1",
+            valueInputOption="RAW",
+            body={"values": [headers]},
+        ).execute()
+
+        conferido = sheets.get("BASE_VENDAS!A1:AE1")
+        cabecalho_final = [clean(x) for x in (conferido[0] if conferido else [])]
+
+        if cabecalho_final != headers:
+            return {
+                "status": "error",
+                "error": "Reparo executado, mas a validação final do cabeçalho falhou.",
+                "cabecalho_final": cabecalho_final,
+                "cabecalho_esperado": headers,
+                "backup": "BASE_VENDAS_BACKUP",
+            }
+
+        return {
+            "status": "ok",
+            "message": "BASE_VENDAS reparada com sucesso. Cabeçalho A:AE recriado e conteúdo anterior preservado em backup.",
+            "colunas": len(headers),
+            "cabecalho": headers,
+            "linhas_backup": max(0, len(atual) - 1) if atual else 0,
+            "aba_backup": "BASE_VENDAS_BACKUP",
+            "proximo_passo": "/omie/nfe/build-base-test",
+        }
+
+    except Exception as e:
+        return {"status": "error", "error": repr(e)}
+
+
 @app.get("/omie/nfe/build-base-test")
 def build_base_test():
     """
