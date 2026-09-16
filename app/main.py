@@ -3,7 +3,6 @@ import os
 
 from fastapi import FastAPI
 
-from app.services.sync import SyncService
 from app.sheets.client import SheetsClient
 from app.omie.client import OmieClient
 from app.omie.resources import ENDPOINTS, normalize_nfe
@@ -13,6 +12,46 @@ app = FastAPI(
     title="Lenvie Commercial KPIs",
     version="1.0.0",
 )
+
+
+# ============================================================
+# CONFIGURAÇÕES AUXILIARES
+# ============================================================
+
+def get_omie_client():
+    app_key = os.getenv("APP_KEY_OMIE")
+    app_secret = os.getenv("APP_SECRET_OMIE")
+
+    if not app_key:
+        raise RuntimeError("Variável APP_KEY_OMIE não configurada.")
+
+    if not app_secret:
+        raise RuntimeError("Variável APP_SECRET_OMIE não configurada.")
+
+    return OmieClient(
+        app_key=app_key,
+        app_secret=app_secret,
+    )
+
+
+def get_sheets_client():
+    google_sa_json = os.getenv("GOOGLE_SA_JSON")
+    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
+
+    if not google_sa_json:
+        raise RuntimeError("Variável GOOGLE_SA_JSON não configurada.")
+
+    if not spreadsheet_id:
+        raise RuntimeError(
+            "Variável GOOGLE_SPREADSHEET_ID não configurada."
+        )
+
+    service_account_info = json.loads(google_sa_json)
+
+    return SheetsClient(
+        service_account_info=service_account_info,
+        spreadsheet_id=spreadsheet_id,
+    )
 
 
 # ============================================================
@@ -48,43 +87,18 @@ def health():
 def test_sheets():
 
     try:
-        google_sa_json = os.getenv("GOOGLE_SA_JSON")
-        spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-
-        if not google_sa_json:
-            return {
-                "status": "error",
-                "error": "Variável GOOGLE_SA_JSON não configurada.",
-            }
-
-        if not spreadsheet_id:
-            return {
-                "status": "error",
-                "error": "Variável GOOGLE_SPREADSHEET_ID não configurada.",
-            }
-
-        service_account_info = json.loads(google_sa_json)
-
-        sheets = SheetsClient(
-            service_account_info=service_account_info,
-            spreadsheet_id=spreadsheet_id,
-        )
+        sheets = get_sheets_client()
 
         values = sheets.get("CONFIG!A1:B5")
 
         return {
             "status": "ok",
-            "message": "Conexão com Google Sheets realizada com sucesso.",
-            "spreadsheet_id": spreadsheet_id,
+            "message": (
+                "Conexão com Google Sheets realizada com sucesso."
+            ),
+            "spreadsheet_id": os.getenv("GOOGLE_SPREADSHEET_ID"),
             "range_testado": "CONFIG!A1:B5",
             "linhas_lidas": len(values),
-        }
-
-    except json.JSONDecodeError as e:
-        return {
-            "status": "error",
-            "error": "GOOGLE_SA_JSON não contém um JSON válido.",
-            "detail": str(e),
         }
 
     except Exception as e:
@@ -102,25 +116,7 @@ def test_sheets():
 def test_omie():
 
     try:
-        app_key = os.getenv("APP_KEY_OMIE")
-        app_secret = os.getenv("APP_SECRET_OMIE")
-
-        if not app_key:
-            return {
-                "status": "error",
-                "error": "Variável APP_KEY_OMIE não configurada.",
-            }
-
-        if not app_secret:
-            return {
-                "status": "error",
-                "error": "Variável APP_SECRET_OMIE não configurada.",
-            }
-
-        omie = OmieClient(
-            app_key=app_key,
-            app_secret=app_secret,
-        )
+        omie = get_omie_client()
 
         resposta = omie.call(
             endpoint=ENDPOINTS["clientes"],
@@ -137,7 +133,9 @@ def test_omie():
             "message": "Conexão com Omie realizada com sucesso.",
             "pagina": resposta.get("pagina"),
             "total_de_paginas": resposta.get("total_de_paginas"),
-            "total_de_registros": resposta.get("total_de_registros"),
+            "total_de_registros": resposta.get(
+                "total_de_registros"
+            ),
         }
 
     except Exception as e:
@@ -153,37 +151,9 @@ def test_omie():
 
 @app.get("/omie/nfe/test")
 def test_omie_nfe():
-    """
-    Consulta somente 1 NF no Omie.
-
-    NÃO grava nada no Google Sheets.
-    NÃO executa sincronização.
-    NÃO altera KPIs.
-
-    Serve apenas para validar:
-    Omie -> ListarNF -> normalização.
-    """
 
     try:
-        app_key = os.getenv("APP_KEY_OMIE")
-        app_secret = os.getenv("APP_SECRET_OMIE")
-
-        if not app_key:
-            return {
-                "status": "error",
-                "error": "Variável APP_KEY_OMIE não configurada.",
-            }
-
-        if not app_secret:
-            return {
-                "status": "error",
-                "error": "Variável APP_SECRET_OMIE não configurada.",
-            }
-
-        omie = OmieClient(
-            app_key=app_key,
-            app_secret=app_secret,
-        )
+        omie = get_omie_client()
 
         resposta = omie.call(
             endpoint=ENDPOINTS["nfe"],
@@ -198,8 +168,6 @@ def test_omie_nfe():
 
         rows = normalize_nfe(notas)
 
-        # Não retornamos o RAW completo.
-        # Apenas uma amostra da primeira linha normalizada.
         amostra = None
 
         if rows:
@@ -232,10 +200,14 @@ def test_omie_nfe():
 
         return {
             "status": "ok",
-            "message": "ListarNF executado e normalizado com sucesso.",
+            "message": (
+                "ListarNF executado e normalizado com sucesso."
+            ),
             "pagina": resposta.get("pagina"),
             "total_de_paginas": resposta.get("total_de_paginas"),
-            "total_de_registros": resposta.get("total_de_registros"),
+            "total_de_registros": resposta.get(
+                "total_de_registros"
+            ),
             "nfs_recebidas": len(notas),
             "itens_normalizados": len(rows),
             "amostra_primeiro_item": amostra,
@@ -249,15 +221,182 @@ def test_omie_nfe():
 
 
 # ============================================================
-# SYNC
+# CARGA CONTROLADA NF-e -> SHEETS
+# ============================================================
+
+@app.get("/omie/nfe/load-test")
+def load_test_nfe():
+    """
+    TESTE CONTROLADO.
+
+    Busca NFs de 01/08/2026 até 03/08/2026
+    e grava SOMENTE na aba OMIE_NF.
+
+    Não altera:
+    - BASE_VENDAS
+    - KPI_MENSAL
+    - CARTEIRA
+    - CONFIG
+    - demais abas
+    """
+
+    try:
+        omie = get_omie_client()
+        sheets = get_sheets_client()
+
+        data_inicial = "01/08/2026"
+        data_final = "03/08/2026"
+
+        todas_notas = []
+
+        pagina = 1
+        total_paginas = 1
+
+        # ----------------------------------------------------
+        # Paginação controlada por período
+        # ----------------------------------------------------
+
+        while pagina <= total_paginas:
+
+            resposta = omie.call(
+                endpoint=ENDPOINTS["nfe"],
+                call="ListarNF",
+                param={
+                    "pagina": pagina,
+                    "registros_por_pagina": 100,
+                    "dEmiInicial": data_inicial,
+                    "dEmiFinal": data_final,
+                },
+            )
+
+            notas = resposta.get("nfCadastro") or []
+
+            todas_notas.extend(notas)
+
+            total_paginas = int(
+                resposta.get("total_de_paginas") or 1
+            )
+
+            pagina += 1
+
+        # ----------------------------------------------------
+        # Normalização
+        # Uma linha por item da NF
+        # ----------------------------------------------------
+
+        rows = normalize_nfe(todas_notas)
+
+        # ----------------------------------------------------
+        # Cabeçalho da OMIE_NF
+        # ----------------------------------------------------
+
+        headers = [
+            "ID_NF",
+            "CHAVE_NFE",
+            "NUM_NF",
+            "SERIE",
+            "DATA_EMISSAO",
+            "TIPO_NF",
+            "DATA_CANCELAMENTO",
+            "ID_PEDIDO",
+            "NUM_PEDIDO",
+            "COD_CLIENTE",
+            "CNPJ_CPF",
+            "CLIENTE_NOME",
+            "COD_VENDEDOR",
+            "CATEGORIA",
+            "ID_ITEM",
+            "COD_PRODUTO_OMIE",
+            "SKU",
+            "PRODUTO",
+            "CFOP",
+            "NCM",
+            "QUANTIDADE",
+            "UNIDADE",
+            "VALOR_UNITARIO",
+            "VALOR_PRODUTO",
+            "DESCONTO_ITEM",
+            "FRETE_ITEM",
+            "OUTROS_ITEM",
+            "VALOR_TOTAL_ITEM",
+            "VALOR_PRODUTOS_NF",
+            "DESCONTO_NF",
+            "VALOR_NF",
+            "RAW_JSON",
+        ]
+
+        # ----------------------------------------------------
+        # Gravação
+        #
+        # Como a aba é nova, escrevemos tudo desde A1.
+        # Somente OMIE_NF será alterada.
+        # ----------------------------------------------------
+
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'OMIE_NF'!A:AF",
+            body={},
+        ).execute()
+
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'OMIE_NF'!A1",
+            valueInputOption="RAW",
+            body={
+                "values": [headers] + rows
+            },
+        ).execute()
+
+        # ----------------------------------------------------
+        # Resumo
+        # ----------------------------------------------------
+
+        nfs_unicas = {
+            str(row[0])
+            for row in rows
+            if row and row[0]
+        }
+
+        cfops = sorted(
+            {
+                str(row[18])
+                for row in rows
+                if len(row) > 18 and row[18]
+            }
+        )
+
+        return {
+            "status": "ok",
+            "message": (
+                "Carga controlada gravada na aba OMIE_NF."
+            ),
+            "periodo": {
+                "inicio": data_inicial,
+                "fim": data_final,
+            },
+            "nfs_recebidas": len(todas_notas),
+            "nfs_unicas": len(nfs_unicas),
+            "itens_gravados": len(rows),
+            "cfops_encontrados": cfops,
+            "aba_destino": "OMIE_NF",
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+# ============================================================
+# SYNC OFICIAL
 # ============================================================
 
 @app.post("/sync")
 def run_sync():
     """
-    IMPORTANTE:
-    Esta rota ainda não deve ser executada.
-    A sincronização será reestruturada para NF-e.
+    Sincronização oficial permanece bloqueada
+    enquanto validamos a nova arquitetura NF-e.
     """
 
     return {
