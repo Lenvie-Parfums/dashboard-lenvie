@@ -1,483 +1,3 @@
-import json
-import os
-from datetime import datetime
-
-from fastapi import FastAPI
-
-from app.sheets.client import SheetsClient
-from app.omie.client import OmieClient
-from app.omie.resources import ENDPOINTS, normalize_nfe
-
-
-app = FastAPI(
-    title="Lenvie Commercial KPIs",
-    version="1.1.0",
-)
-
-
-# ============================================================
-# CLIENTES / CONFIG
-# ============================================================
-
-def get_omie_client():
-    app_key = os.getenv("APP_KEY_OMIE")
-    app_secret = os.getenv("APP_SECRET_OMIE")
-
-    if not app_key:
-        raise RuntimeError("Variável APP_KEY_OMIE não configurada.")
-
-    if not app_secret:
-        raise RuntimeError("Variável APP_SECRET_OMIE não configurada.")
-
-    return OmieClient(
-        app_key=app_key,
-        app_secret=app_secret,
-    )
-
-
-def get_sheets_client():
-    google_sa_json = os.getenv("GOOGLE_SA_JSON")
-    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-
-    if not google_sa_json:
-        raise RuntimeError("Variável GOOGLE_SA_JSON não configurada.")
-
-    if not spreadsheet_id:
-        raise RuntimeError(
-            "Variável GOOGLE_SPREADSHEET_ID não configurada."
-        )
-
-    try:
-        service_account_info = json.loads(google_sa_json)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "GOOGLE_SA_JSON não contém um JSON válido."
-        ) from exc
-
-    return SheetsClient(
-        service_account_info=service_account_info,
-        spreadsheet_id=spreadsheet_id,
-    )
-
-
-# ============================================================
-# AUXILIARES
-# ============================================================
-
-def clean(value):
-    return str(value or "").strip()
-
-
-def normalize_cfop(value):
-    """
-    Exemplos:
-    6.101 -> 6101
-    6.910 -> 6910
-    5.102 -> 5102
-    """
-    return "".join(
-        char for char in clean(value)
-        if char.isdigit()
-    )
-
-
-def parse_br_date(value):
-    value = clean(value)
-
-    if not value:
-        return None
-
-    for fmt in (
-        "%d/%m/%Y",
-        "%Y-%m-%d",
-        "%d/%m/%Y %H:%M:%S",
-    ):
-        try:
-            return datetime.strptime(value[:19], fmt)
-        except ValueError:
-            pass
-
-    return None
-
-
-def get_or_create_sheet(sheets, sheet_name):
-    """
-    Cria a aba caso ainda não exista.
-    """
-
-    metadata = (
-        sheets.api
-        .spreadsheets()
-        .get(spreadsheetId=sheets.spreadsheet_id)
-        .execute()
-    )
-
-    existing = {
-        item["properties"]["title"]
-        for item in metadata.get("sheets", [])
-    }
-
-    if sheet_name not in existing:
-        (
-            sheets.api
-            .spreadsheets()
-            .batchUpdate(
-                spreadsheetId=sheets.spreadsheet_id,
-                body={
-                    "requests": [
-                        {
-                            "addSheet": {
-                                "properties": {
-                                    "title": sheet_name
-                                }
-                            }
-                        }
-                    ]
-                },
-            )
-            .execute()
-        )
-
-
-def rows_to_objects(values):
-    if not values:
-        return []
-
-    headers = [clean(x) for x in values[0]]
-
-    result = []
-
-    for row in values[1:]:
-        if not any(clean(x) for x in row):
-            continue
-
-        obj = {}
-
-        for i, header in enumerate(headers):
-            obj[header] = row[i] if i < len(row) else ""
-
-        result.append(obj)
-
-    return result
-
-
-# ============================================================
-# ROOT
-# ============================================================
-
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "service": "KPIs comerciais da Lenvie",
-        "arquitetura": "render+sheets-v1",
-    }
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "architecture": "render+sheets-v1",
-    }
-
-
-# ============================================================
-# GOOGLE SHEETS TEST
-# ============================================================
-
-@app.get("/sheets/test")
-def test_sheets():
-    try:
-        sheets = get_sheets_client()
-
-        values = sheets.get("CONFIG!A1:B5")
-
-        return {
-            "status": "ok",
-            "message": (
-                "Conexão com Google Sheets realizada com sucesso."
-            ),
-            "spreadsheet_id": os.getenv(
-                "GOOGLE_SPREADSHEET_ID"
-            ),
-            "range_testado": "CONFIG!A1:B5",
-            "linhas_lidas": len(values),
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-        }
-
-
-# ============================================================
-# OMIE TEST
-# ============================================================
-
-@app.get("/omie/test")
-def test_omie():
-    try:
-        omie = get_omie_client()
-
-        resposta = omie.call(
-            endpoint=ENDPOINTS["clientes"],
-            call="ListarClientes",
-            param={
-                "pagina": 1,
-                "registros_por_pagina": 1,
-                "apenas_importado_api": "N",
-            },
-        )
-
-        return {
-            "status": "ok",
-            "message": "Conexão com Omie realizada com sucesso.",
-            "pagina": resposta.get("pagina"),
-            "total_de_paginas": resposta.get(
-                "total_de_paginas"
-            ),
-            "total_de_registros": resposta.get(
-                "total_de_registros"
-            ),
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-        }
-
-
-# ============================================================
-# LISTAR NF TEST
-# ============================================================
-
-@app.get("/omie/nfe/test")
-def test_omie_nfe():
-    try:
-        omie = get_omie_client()
-
-        resposta = omie.call(
-            endpoint=ENDPOINTS["nfe"],
-            call="ListarNF",
-            param={
-                "pagina": 1,
-                "registros_por_pagina": 1,
-            },
-        )
-
-        notas = resposta.get("nfCadastro") or []
-        rows = normalize_nfe(notas)
-
-        amostra = None
-
-        if rows:
-            r = rows[0]
-
-            amostra = {
-                "id_nf": r[0],
-                "chave_nfe": r[1],
-                "numero_nf": r[2],
-                "serie": r[3],
-                "data_emissao": r[4],
-                "tipo_nf": r[5],
-                "id_pedido": r[7],
-                "numero_pedido": r[8],
-                "cliente_id": r[9],
-                "cliente_documento": r[10],
-                "cliente_nome": r[11],
-                "vendedor_id": r[12],
-                "categoria": r[13],
-                "sku": r[16],
-                "produto": r[17],
-                "cfop": r[18],
-                "quantidade": r[20],
-                "valor_unitario": r[22],
-                "valor_produto": r[23],
-                "desconto_item": r[24],
-                "valor_total_item": r[27],
-                "valor_nf": r[30],
-            }
-
-        return {
-            "status": "ok",
-            "message": (
-                "ListarNF executado e normalizado com sucesso."
-            ),
-            "pagina": resposta.get("pagina"),
-            "total_de_paginas": resposta.get(
-                "total_de_paginas"
-            ),
-            "total_de_registros": resposta.get(
-                "total_de_registros"
-            ),
-            "nfs_recebidas": len(notas),
-            "itens_normalizados": len(rows),
-            "amostra_primeiro_item": amostra,
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-        }
-
-
-# ============================================================
-# CARGA CONTROLADA NF -> OMIE_NF
-# ============================================================
-
-@app.get("/omie/nfe/load-test")
-def load_test_nfe():
-    """
-    Carga controlada:
-    01/08/2026 até 03/08/2026.
-
-    Grava somente OMIE_NF.
-    """
-
-    try:
-        omie = get_omie_client()
-        sheets = get_sheets_client()
-
-        data_inicial = "01/08/2026"
-        data_final = "03/08/2026"
-
-        todas_notas = []
-
-        pagina = 1
-        total_paginas = 1
-
-        while pagina <= total_paginas:
-            resposta = omie.call(
-                endpoint=ENDPOINTS["nfe"],
-                call="ListarNF",
-                param={
-                    "pagina": pagina,
-                    "registros_por_pagina": 100,
-                    "dEmiInicial": data_inicial,
-                    "dEmiFinal": data_final,
-                },
-            )
-
-            notas = resposta.get("nfCadastro") or []
-
-            todas_notas.extend(notas)
-
-            total_paginas = int(
-                resposta.get("total_de_paginas") or 1
-            )
-
-            pagina += 1
-
-        rows = normalize_nfe(todas_notas)
-
-        headers = [
-            "ID_NF",
-            "CHAVE_NFE",
-            "NUM_NF",
-            "SERIE",
-            "DATA_EMISSAO",
-            "TIPO_NF",
-            "DATA_CANCELAMENTO",
-            "ID_PEDIDO",
-            "NUM_PEDIDO",
-            "COD_CLIENTE",
-            "CNPJ_CPF",
-            "CLIENTE_NOME",
-            "COD_VENDEDOR",
-            "CATEGORIA",
-            "ID_ITEM",
-            "COD_PRODUTO_OMIE",
-            "SKU",
-            "PRODUTO",
-            "CFOP",
-            "NCM",
-            "QUANTIDADE",
-            "UNIDADE",
-            "VALOR_UNITARIO",
-            "VALOR_PRODUTO",
-            "DESCONTO_ITEM",
-            "FRETE_ITEM",
-            "OUTROS_ITEM",
-            "VALOR_TOTAL_ITEM",
-            "VALOR_PRODUTOS_NF",
-            "DESCONTO_NF",
-            "VALOR_NF",
-            "RAW_JSON",
-        ]
-
-        get_or_create_sheet(
-            sheets,
-            "OMIE_NF",
-        )
-
-        (
-            sheets.api
-            .spreadsheets()
-            .values()
-            .clear(
-                spreadsheetId=sheets.spreadsheet_id,
-                range="'OMIE_NF'!A:AF",
-                body={},
-            )
-            .execute()
-        )
-
-        (
-            sheets.api
-            .spreadsheets()
-            .values()
-            .update(
-                spreadsheetId=sheets.spreadsheet_id,
-                range="'OMIE_NF'!A1",
-                valueInputOption="RAW",
-                body={
-                    "values": [headers] + rows
-                },
-            )
-            .execute()
-        )
-
-        nfs_unicas = {
-            str(row[0])
-            for row in rows
-            if row and row[0]
-        }
-
-        cfops = sorted(
-            {
-                str(row[18])
-                for row in rows
-                if len(row) > 18 and row[18]
-            }
-        )
-
-        return {
-            "status": "ok",
-            "message": (
-                "Carga controlada gravada na aba OMIE_NF."
-            ),
-            "periodo": {
-                "inicio": data_inicial,
-                "fim": data_final,
-            },
-            "nfs_recebidas": len(todas_notas),
-            "nfs_unicas": len(nfs_unicas),
-            "itens_gravados": len(rows),
-            "cfops_encontrados": cfops,
-            "aba_destino": "OMIE_NF",
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-        }
-
-
 # ============================================================
 # OMIE_NF -> BASE_VENDAS
 # ============================================================
@@ -485,27 +5,30 @@ def load_test_nfe():
 @app.get("/omie/nfe/build-base-test")
 def build_base_test():
     """
-    Lê OMIE_NF e consolida UMA LINHA POR NF.
+    Lê OMIE_NF, classifica cada ITEM pelo CFOP e depois
+    consolida UMA LINHA POR NF.
+
+    Regras temporárias de validação:
+
+    VENDA:
+    5101, 5102, 6101, 6102, 6401
+
+    EXCLUIR:
+    5910, 6910
+
+    Demais CFOPs:
+    PENDENTE
 
     IMPORTANTE:
-    Nesta fase não classificamos automaticamente
-    CFOP como venda/não venda.
-
-    Apenas algumas situações objetivas são marcadas:
-    - TIPO_NF diferente de 1
-    - NF com data de cancelamento
-    - CFOP 5.910 / 6.910
-
-    Os demais registros ficam como PENDENTE_VALIDACAO.
+    Uma NF pode conter venda + bonificação.
+    Nesse caso somente os itens de venda entram no
+    VALOR_COMERCIAL.
     """
 
     try:
         sheets = get_sheets_client()
 
-        values = sheets.get(
-            "OMIE_NF!A1:AF50000"
-        )
-
+        values = sheets.get("OMIE_NF!A1:AF50000")
         itens = rows_to_objects(values)
 
         if not itens:
@@ -518,16 +41,114 @@ def build_base_test():
             }
 
         # ----------------------------------------------------
+        # REGRAS TEMPORÁRIAS DE CFOP
+        # ----------------------------------------------------
+
+        CFOPS_VENDA = {
+            "5101",
+            "5102",
+            "6101",
+            "6102",
+            "6401",
+        }
+
+        CFOPS_EXCLUIR = {
+            "5910",
+            "6910",
+        }
+
+        # ----------------------------------------------------
+        # Conversão segura para número
+        # ----------------------------------------------------
+
+        def to_float(value):
+            if value in (None, ""):
+                return 0.0
+
+            if isinstance(value, (int, float)):
+                return float(value)
+
+            text = str(value).strip()
+
+            try:
+                return float(text)
+            except ValueError:
+                pass
+
+            # fallback para números no formato brasileiro
+            try:
+                return float(
+                    text.replace(".", "").replace(",", ".")
+                )
+            except ValueError:
+                return 0.0
+
+        # ----------------------------------------------------
         # Agrupamento por NF
         # ----------------------------------------------------
 
         nfs = {}
 
+        resumo_itens = {
+            "VENDA": 0,
+            "EXCLUIDO": 0,
+            "PENDENTE": 0,
+        }
+
+        cfops_pendentes = set()
+
         for item in itens:
+
             id_nf = clean(item.get("ID_NF"))
 
             if not id_nf:
                 continue
+
+            cfop_original = clean(item.get("CFOP"))
+            cfop = normalize_cfop(cfop_original)
+
+            # ------------------------------------------------
+            # Classificação DO ITEM
+            # ------------------------------------------------
+
+            if cfop in CFOPS_VENDA:
+                classificacao = "VENDA"
+
+            elif cfop in CFOPS_EXCLUIR:
+                classificacao = "EXCLUIDO"
+
+            else:
+                classificacao = "PENDENTE"
+
+                if cfop_original:
+                    cfops_pendentes.add(cfop_original)
+
+            resumo_itens[classificacao] += 1
+
+            # ------------------------------------------------
+            # Valor do item
+            #
+            # Nesta fase usamos VALOR_PRODUTO - DESCONTO_ITEM.
+            #
+            # Não usamos VALOR_NF porque ele se repete em cada
+            # item da mesma nota.
+            # ------------------------------------------------
+
+            valor_produto = to_float(
+                item.get("VALOR_PRODUTO")
+            )
+
+            desconto_item = to_float(
+                item.get("DESCONTO_ITEM")
+            )
+
+            valor_liquido_item = (
+                valor_produto - desconto_item
+            )
+
+            # ------------------------------------------------
+            # Criação da NF
+            # ------------------------------------------------
 
             if id_nf not in nfs:
                 nfs[id_nf] = {
@@ -571,36 +192,80 @@ def build_base_test():
                     "CATEGORIA": clean(
                         item.get("CATEGORIA")
                     ),
-                    "VALOR_NF": item.get(
-                        "VALOR_NF", 0
+                    "VALOR_NF": to_float(
+                        item.get("VALOR_NF")
                     ),
                     "CFOPS": set(),
+                    "CFOPS_VENDA": set(),
+                    "CFOPS_EXCLUIDOS": set(),
+                    "CFOPS_PENDENTES": set(),
                     "SKUS": set(),
                     "QTD_ITENS": 0,
+                    "ITENS_VENDA": 0,
+                    "ITENS_EXCLUIDOS": 0,
+                    "ITENS_PENDENTES": 0,
+                    "VALOR_COMERCIAL": 0.0,
+                    "VALOR_EXCLUIDO": 0.0,
+                    "VALOR_PENDENTE": 0.0,
                 }
 
             nf = nfs[id_nf]
 
-            cfop = clean(item.get("CFOP"))
-            sku = clean(item.get("SKU"))
+            # ------------------------------------------------
+            # Acumulação
+            # ------------------------------------------------
 
-            if cfop:
-                nf["CFOPS"].add(cfop)
+            if cfop_original:
+                nf["CFOPS"].add(cfop_original)
+
+            sku = clean(item.get("SKU"))
 
             if sku:
                 nf["SKUS"].add(sku)
 
             nf["QTD_ITENS"] += 1
 
+            if classificacao == "VENDA":
+                nf["ITENS_VENDA"] += 1
+                nf["VALOR_COMERCIAL"] += valor_liquido_item
+
+                if cfop_original:
+                    nf["CFOPS_VENDA"].add(
+                        cfop_original
+                    )
+
+            elif classificacao == "EXCLUIDO":
+                nf["ITENS_EXCLUIDOS"] += 1
+                nf["VALOR_EXCLUIDO"] += valor_liquido_item
+
+                if cfop_original:
+                    nf["CFOPS_EXCLUIDOS"].add(
+                        cfop_original
+                    )
+
+            else:
+                nf["ITENS_PENDENTES"] += 1
+                nf["VALOR_PENDENTE"] += valor_liquido_item
+
+                if cfop_original:
+                    nf["CFOPS_PENDENTES"].add(
+                        cfop_original
+                    )
+
         # ----------------------------------------------------
-        # Montagem da BASE_VENDAS
+        # Consolidação por NF
         # ----------------------------------------------------
 
         rows = []
 
-        resumo_status = {}
+        resumo_nfs = {
+            "SIM": 0,
+            "NAO": 0,
+            "PENDENTE": 0,
+        }
 
         for nf in nfs.values():
+
             data = parse_br_date(
                 nf["DATA_EMISSAO"]
             )
@@ -611,43 +276,64 @@ def build_base_test():
                 else ""
             )
 
-            cfops = sorted(nf["CFOPS"])
+            # ------------------------------------------------
+            # Classificação da NF
+            #
+            # A classificação comercial depende dos ITENS.
+            # Não usamos TIPO_NF como filtro principal.
+            # ------------------------------------------------
 
-            cfops_norm = {
-                normalize_cfop(x)
-                for x in cfops
-            }
-
-            tipo_nf = clean(nf["TIPO_NF"])
-
-            venda_valida = "PENDENTE"
-            motivo = "PENDENTE_VALIDACAO_CFOP"
-
-            # Entrada
-            if tipo_nf and tipo_nf != "1":
-                venda_valida = "NAO"
-                motivo = "TIPO_NF_NAO_SAIDA"
-
-            # Cancelamento
-            elif nf["DATA_CANCELAMENTO"]:
+            if nf["DATA_CANCELAMENTO"]:
                 venda_valida = "NAO"
                 motivo = "NF_CANCELADA"
 
-            # Bonificação/remessa 5910/6910
-            elif (
-                "5910" in cfops_norm
-                or "6910" in cfops_norm
-            ):
-                venda_valida = "NAO"
-                motivo = "CFOP_5910_6910"
+                # NF cancelada não entra no faturamento
+                valor_comercial = 0.0
 
-            resumo_status[venda_valida] = (
-                resumo_status.get(
-                    venda_valida,
-                    0,
+            elif (
+                nf["ITENS_VENDA"] > 0
+                and nf["ITENS_PENDENTES"] == 0
+            ):
+                venda_valida = "SIM"
+
+                if nf["ITENS_EXCLUIDOS"] > 0:
+                    motivo = (
+                        "VENDA_COM_ITENS_EXCLUIDOS"
+                    )
+                else:
+                    motivo = "VENDA"
+
+                valor_comercial = nf[
+                    "VALOR_COMERCIAL"
+                ]
+
+            elif nf["ITENS_VENDA"] > 0:
+                venda_valida = "PENDENTE"
+                motivo = (
+                    "VENDA_COM_CFOP_PENDENTE"
                 )
-                + 1
-            )
+
+                # Mantemos o valor conhecido de venda,
+                # mas a NF ainda não está aprovada para KPI.
+                valor_comercial = nf[
+                    "VALOR_COMERCIAL"
+                ]
+
+            elif nf["ITENS_PENDENTES"] > 0:
+                venda_valida = "PENDENTE"
+                motivo = (
+                    "SOMENTE_CFOP_PENDENTE"
+                )
+                valor_comercial = 0.0
+
+            else:
+                venda_valida = "NAO"
+                motivo = (
+                    "SOMENTE_ITENS_EXCLUIDOS"
+                )
+                valor_comercial = 0.0
+
+            resumo_nfs[venda_valida] += 1
 
             rows.append(
                 [
@@ -663,18 +349,68 @@ def build_base_test():
                     nf["CNPJ_CPF"],
                     nf["CLIENTE_NOME"],
                     nf["COD_VENDEDOR"],
+
                     "",  # REP_ID
                     "",  # REPRESENTANTE
+
                     nf["CATEGORIA"],
-                    nf["VALOR_NF"],
+
+                    round(
+                        nf["VALOR_NF"],
+                        2,
+                    ),
+
+                    round(
+                        valor_comercial,
+                        2,
+                    ),
+
+                    round(
+                        nf["VALOR_EXCLUIDO"],
+                        2,
+                    ),
+
+                    round(
+                        nf["VALOR_PENDENTE"],
+                        2,
+                    ),
+
                     nf["TIPO_NF"],
-                    ";".join(cfops),
+
+                    ";".join(
+                        sorted(nf["CFOPS"])
+                    ),
+
+                    ";".join(
+                        sorted(nf["CFOPS_VENDA"])
+                    ),
+
+                    ";".join(
+                        sorted(
+                            nf["CFOPS_EXCLUIDOS"]
+                        )
+                    ),
+
+                    ";".join(
+                        sorted(
+                            nf["CFOPS_PENDENTES"]
+                        )
+                    ),
+
                     nf["QTD_ITENS"],
+                    nf["ITENS_VENDA"],
+                    nf["ITENS_EXCLUIDOS"],
+                    nf["ITENS_PENDENTES"],
                     len(nf["SKUS"]),
+
                     venda_valida,
                     motivo,
                 ]
             )
+
+        # ----------------------------------------------------
+        # Ordenação
+        # ----------------------------------------------------
 
         rows.sort(
             key=lambda r: (
@@ -683,6 +419,10 @@ def build_base_test():
                 r[4],
             )
         )
+
+        # ----------------------------------------------------
+        # Cabeçalhos
+        # ----------------------------------------------------
 
         headers = [
             "COMPETENCIA",
@@ -700,17 +440,31 @@ def build_base_test():
             "REP_ID",
             "REPRESENTANTE",
             "CATEGORIA",
+
             "VALOR_NF",
+            "VALOR_COMERCIAL",
+            "VALOR_EXCLUIDO",
+            "VALOR_PENDENTE",
+
             "TIPO_NF",
+
             "CFOPS",
+            "CFOPS_VENDA",
+            "CFOPS_EXCLUIDOS",
+            "CFOPS_PENDENTES",
+
             "QTD_ITENS",
+            "ITENS_VENDA",
+            "ITENS_EXCLUIDOS",
+            "ITENS_PENDENTES",
             "QTD_SKUS",
+
             "VENDA_VALIDA",
-            "MOTIVO_EXCLUSAO",
+            "MOTIVO",
         ]
 
         # ----------------------------------------------------
-        # Cria BASE_VENDAS se necessário
+        # Gravação BASE_VENDAS
         # ----------------------------------------------------
 
         get_or_create_sheet(
@@ -718,20 +472,18 @@ def build_base_test():
             "BASE_VENDAS",
         )
 
-        # Limpa SOMENTE BASE_VENDAS
         (
             sheets.api
             .spreadsheets()
             .values()
             .clear(
                 spreadsheetId=sheets.spreadsheet_id,
-                range="'BASE_VENDAS'!A:V",
+                range="'BASE_VENDAS'!A:AE",
                 body={},
             )
             .execute()
         )
 
-        # Grava base consolidada
         (
             sheets.api
             .spreadsheets()
@@ -747,26 +499,53 @@ def build_base_test():
             .execute()
         )
 
+        # ----------------------------------------------------
+        # Totais de validação
+        # ----------------------------------------------------
+
+        faturamento_aprovado = round(
+            sum(
+                row[16]
+                for row in rows
+                if row[29] == "SIM"
+            ),
+            2,
+        )
+
+        faturamento_pendente = round(
+            sum(
+                row[16]
+                for row in rows
+                if row[29] == "PENDENTE"
+            ),
+            2,
+        )
+
         return {
             "status": "ok",
             "message": (
-                "BASE_VENDAS de validação criada "
-                "com uma linha por NF."
+                "BASE_VENDAS reconstruída com "
+                "classificação por item/CFOP."
             ),
+
             "itens_origem": len(itens),
             "nfs_consolidadas": len(rows),
-            "status": {
-                "SIM": resumo_status.get("SIM", 0),
-                "NAO": resumo_status.get("NAO", 0),
-                "PENDENTE": resumo_status.get(
-                    "PENDENTE",
-                    0,
-                ),
-            },
-            "observacao": (
-                "Nenhuma NF pendente foi considerada "
-                "venda automaticamente."
+
+            "itens": resumo_itens,
+            "nfs": resumo_nfs,
+
+            "faturamento_aprovado": (
+                faturamento_aprovado
             ),
+
+            "faturamento_conhecido_em_nfs_pendentes": (
+                faturamento_pendente
+            ),
+
+            "cfops_pendentes": sorted(
+                cfops_pendentes
+            ),
+
             "aba_destino": "BASE_VENDAS",
         }
 
@@ -775,18 +554,3 @@ def build_base_test():
             "status": "error",
             "error": str(e),
         }
-
-
-# ============================================================
-# SYNC OFICIAL
-# ============================================================
-
-@app.post("/sync")
-def run_sync():
-    return {
-        "status": "blocked",
-        "message": (
-            "Sincronização oficial permanece bloqueada "
-            "durante a validação da arquitetura NF-e."
-        ),
-    }
