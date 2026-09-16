@@ -722,7 +722,7 @@ def build_base_test():
 # ============================================================
 
 @app.get("/omie/pedidos/load-test")
-def load_test_pedidos():
+def load_test_pedidos(limit: int = 5, offset: int = 0):
     """
     Lê os ID_PEDIDO já existentes em OMIE_NF e consulta
     diretamente cada pedido no Omie usando ConsultarPedido.
@@ -731,6 +731,9 @@ def load_test_pedidos():
     Não altera OMIE_NF, BASE_VENDAS ou KPIs.
     """
     try:
+        limit = max(1, min(limit, 10))
+        offset = max(0, offset)
+
         omie = get_omie_client()
         sheets = get_sheets_client()
 
@@ -766,6 +769,21 @@ def load_test_pedidos():
                 "error": "Nenhum ID_PEDIDO encontrado na OMIE_NF.",
             }
 
+        total_ids = len(ids_pedidos)
+        lote = ids_pedidos[offset:offset + limit]
+
+        if not lote:
+            return {
+                "status": "ok",
+                "message": "Não há mais pedidos para este offset.",
+                "total_ids_pedido": total_ids,
+                "offset": offset,
+                "limit": limit,
+                "consultados_neste_lote": 0,
+                "proximo_offset": None,
+                "finalizado": True,
+            }
+
         rows = []
         erros = []
         categorias = set()
@@ -773,7 +791,7 @@ def load_test_pedidos():
         vendedores = set()
         etapas = set()
 
-        for id_pedido in ids_pedidos:
+        for id_pedido in lote:
             try:
                 # A documentação do Omie define ConsultarPedido
                 # com o parâmetro codigo_pedido.
@@ -935,35 +953,31 @@ def load_test_pedidos():
             "CAMPOS_INFO_CADASTRO",
         ]
 
-        get_or_create_sheet(
-            sheets,
-            "OMIE_PEDIDOS_TESTE",
-        )
+        get_or_create_sheet(sheets, "OMIE_PEDIDOS_TESTE")
 
-        (
-            sheets.api
-            .spreadsheets()
-            .values()
-            .clear(
+        if offset == 0:
+            sheets.api.spreadsheets().values().clear(
                 spreadsheetId=sheets.spreadsheet_id,
                 range="'OMIE_PEDIDOS_TESTE'!A:R",
                 body={},
-            )
-            .execute()
-        )
-
-        (
-            sheets.api
-            .spreadsheets()
-            .values()
-            .update(
+            ).execute()
+            sheets.api.spreadsheets().values().update(
                 spreadsheetId=sheets.spreadsheet_id,
                 range="'OMIE_PEDIDOS_TESTE'!A1",
                 valueInputOption="RAW",
                 body={"values": [headers] + rows},
-            )
-            .execute()
-        )
+            ).execute()
+        elif rows:
+            sheets.api.spreadsheets().values().append(
+                spreadsheetId=sheets.spreadsheet_id,
+                range="'OMIE_PEDIDOS_TESTE'!A:R",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": rows},
+            ).execute()
+
+        proximo_offset = offset + len(lote)
+        finalizado = proximo_offset >= total_ids
 
         return {
             "status": "ok",
@@ -971,14 +985,20 @@ def load_test_pedidos():
                 "Pedidos vinculados às NFs consultados diretamente "
                 "com ConsultarPedido."
             ),
-            "ids_pedido_encontrados_na_omie_nf": len(ids_pedidos),
-            "pedidos_consultados_com_sucesso": len(rows),
-            "pedidos_com_erro": len(erros),
+            "total_ids_pedido": total_ids,
+            "offset": offset,
+            "limit": limit,
+            "ids_neste_lote": lote,
+            "consultados_neste_lote": len(lote),
+            "sucessos_neste_lote": len(rows),
+            "erros_neste_lote": len(erros),
             "categorias_encontradas": sorted(categorias),
             "origens_encontradas": sorted(origens),
             "etapas_encontradas": sorted(etapas),
             "vendedores_encontrados": len(vendedores),
             "erros_amostra": erros[:10],
+            "proximo_offset": None if finalizado else proximo_offset,
+            "finalizado": finalizado,
             "aba_destino": "OMIE_PEDIDOS_TESTE",
         }
 
