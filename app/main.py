@@ -1,3 +1,4 @@
+import requests
 import json
 import os
 from datetime import datetime
@@ -753,8 +754,8 @@ def load_test_pedidos(limit: int = 5, offset: int = 0):
             id_pedido = clean(row.get("ID_PEDIDO"))
             num_nf = clean(row.get("NUM_NF"))
 
-            if not id_pedido or id_pedido == "0":
-                       continue
+            if not id_pedido:
+                continue
 
             pedidos_nfs.setdefault(id_pedido, set())
 
@@ -1007,6 +1008,45 @@ def load_test_pedidos(limit: int = 5, offset: int = 0):
             "status": "error",
             "error": str(e),
         }
+
+
+
+# ============================================================
+# DIAGNOSTICO DIRETO DO CONSULTARPEDIDO OMIE
+# ============================================================
+
+@app.get("/omie/pedidos/debug-consultar")
+def debug_consultar_pedido():
+    """Diagnostica ConsultarPedido sem alterar o Google Sheets."""
+    try:
+        s = get_settings()
+        codigo_pedido = 9204861332
+        endpoint = ENDPOINTS["pedidos"]
+
+        payload = {
+            "call": "ConsultarPedido",
+            "app_key": s.omie_app_key,
+            "app_secret": s.omie_app_secret,
+            "param": [{"codigo_pedido": codigo_pedido}],
+        }
+
+        response = requests.post(endpoint, json=payload, timeout=30)
+
+        try:
+            response_body = response.json()
+        except Exception:
+            response_body = response.text[:5000]
+
+        return {
+            "status": "ok" if response.ok else "error",
+            "codigo_pedido": codigo_pedido,
+            "endpoint": endpoint,
+            "http_status": response.status_code,
+            "response_body": response_body,
+        }
+
+    except Exception as e:
+        return {"status": "error", "error": repr(e)}
 
 
 # ============================================================
