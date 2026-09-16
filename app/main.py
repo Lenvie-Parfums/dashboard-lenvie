@@ -1086,6 +1086,80 @@ def run_sync():
 # DASHBOARD EXECUTIVO (somente leitura)
 # ============================================================
 
+
+@app.get("/dashboard/auditoria-nfs")
+def dashboard_auditoria_nfs(
+    ano: int = 2026,
+    mes_inicio: int = 1,
+    mes_fim: int = 12,
+    representante: str = "ALL",
+):
+    """Auditoria somente leitura das linhas que entram nos KPIs comerciais."""
+    try:
+        sheets = get_sheets_client()
+        rows = rows_to_objects(sheets.get("BASE_VENDAS!A1:AE50000"))
+
+        detalhes = []
+        total = 0.0
+
+        for i, row in enumerate(rows, start=2):
+            competencia = clean(row.get("COMPETENCIA"))
+            if not competencia:
+                continue
+
+            partes = competencia.replace("/", "-").split("-")
+            try:
+                if len(partes) >= 2 and len(partes[0]) == 4:
+                    row_ano, row_mes = int(partes[0]), int(partes[1])
+                elif len(partes) >= 2:
+                    row_mes, row_ano = int(partes[0]), int(partes[1])
+                else:
+                    continue
+            except Exception:
+                continue
+
+            if row_ano != ano or not (mes_inicio <= row_mes <= mes_fim):
+                continue
+
+            venda_valida = clean(row.get("VENDA_VALIDA")).upper()
+            if venda_valida != "SIM":
+                continue
+
+            if representante != "ALL":
+                rep = clean(row.get("REPRESENTANTE"))
+                rep_id = clean(row.get("REP_ID"))
+                if representante not in (rep, rep_id):
+                    continue
+
+            valor = to_float(row.get("VALOR_COMERCIAL"))
+            total += valor
+
+            detalhes.append({
+                "linha_base_vendas": i,
+                "id_nf": clean(row.get("ID_NF")),
+                "num_nf": clean(row.get("NUM_NF")),
+                "cliente": clean(row.get("CLIENTE_NOME")),
+                "valor_comercial": round(valor, 2),
+                "venda_valida": venda_valida,
+                "cfops_venda": clean(row.get("CFOPS_VENDA")),
+                "motivo": clean(row.get("MOTIVO")),
+            })
+
+        return {
+            "status": "ok",
+            "ano": ano,
+            "mes_inicio": mes_inicio,
+            "mes_fim": mes_fim,
+            "representante": representante,
+            "quantidade_linhas": len(detalhes),
+            "soma_valor_comercial": round(total, 2),
+            "nfs": detalhes,
+            "fonte": "BASE_VENDAS",
+            "modo": "somente_leitura",
+        }
+    except Exception as e:
+        return {"status": "error", "error": repr(e)}
+
 @app.get("/dashboard/executive-kpis")
 def dashboard_executive_kpis(
     ano: int = 2026,
