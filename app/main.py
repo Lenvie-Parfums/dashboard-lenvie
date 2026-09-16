@@ -1131,7 +1131,17 @@ def dashboard_auditoria_nfs(
                 if representante not in (rep, rep_id):
                     continue
 
-            valor = to_float(row.get("VALOR_COMERCIAL"))
+            raw_valor = row.get("VALOR_COMERCIAL")
+            try:
+                if isinstance(raw_valor, (int, float)):
+                    valor = float(raw_valor)
+                else:
+                    s = clean(raw_valor).replace("R$", "").replace(" ", "")
+                    if "," in s:
+                        s = s.replace(".", "").replace(",", ".")
+                    valor = float(s or 0)
+            except Exception:
+                valor = 0.0
             total += valor
 
             detalhes.append({
