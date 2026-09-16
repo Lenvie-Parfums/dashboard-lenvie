@@ -606,10 +606,10 @@ def build_base_test():
     Lê OMIE_NF, classifica cada ITEM pelo CFOP e depois
     consolida UMA LINHA POR NF.
 
-    Regras temporárias:
-    - Venda: 5101, 5102, 6101, 6102, 6401
-    - Excluir: 5910, 6910
-    - Demais CFOPs: PENDENTE
+    Regras atuais:
+    - Venda: 5101, 6101, 5102, 6102, 5910, 6910, 5403, 6403, 6109, 6110
+    - CFOPs não classificados: PENDENTE
+    - Cancelamento: somente quando DATA_CANCELAMENTO contém indicação real de cancelamento
     """
     try:
         sheets = get_sheets_client()
@@ -661,6 +661,20 @@ def build_base_test():
             "6110",
         }
         CFOPS_EXCLUIR = set()
+
+        def is_cancelada(value):
+            """
+            Considera cancelada somente quando a origem traz uma indicação real
+            de cancelamento. Valores técnicos como 0/N/NAO/FALSE não cancelam a NF.
+            Datas válidas de cancelamento continuam sendo tratadas como cancelamento.
+            """
+            v = clean(value)
+            if not v:
+                return False
+            normalizado = v.strip().upper()
+            if normalizado in {"0", "N", "NAO", "NÃO", "FALSE", "NA", "NONE", "NULL", "-"}:
+                return False
+            return True
 
         def to_float(value):
             if value in (None, ""):
@@ -766,7 +780,7 @@ def build_base_test():
             data = parse_br_date(nf["DATA_EMISSAO"])
             competencia = f"{data.year:04d}-{data.month:02d}" if data else ""
 
-            if nf["DATA_CANCELAMENTO"]:
+            if is_cancelada(nf["DATA_CANCELAMENTO"]):
                 venda_valida = "NAO"
                 motivo = "NF_CANCELADA"
                 valor_comercial = 0.0
