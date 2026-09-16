@@ -336,7 +336,7 @@ def normalize_nfe(items):
                     valor_nf,
 
                     # RAW temporário
-                    str(nf),
+                    "",
                 ]
             )
 
