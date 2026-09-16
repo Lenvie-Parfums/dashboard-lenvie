@@ -664,17 +664,26 @@ def build_base_test():
 
         def is_cancelada(value):
             """
-            Considera cancelada somente quando a origem traz uma indicação real
-            de cancelamento. Valores técnicos como 0/N/NAO/FALSE não cancelam a NF.
-            Datas válidas de cancelamento continuam sendo tratadas como cancelamento.
+            DATA_CANCELAMENTO é um campo de data.
+            Só considera a NF cancelada quando houver uma DATA reconhecível.
+            Qualquer código/status/texto residual (ex.: 0, 91, N, NAO) não cancela.
             """
+            import re
+
             v = clean(value)
             if not v:
                 return False
-            normalizado = v.strip().upper()
-            if normalizado in {"0", "N", "NAO", "NÃO", "FALSE", "NA", "NONE", "NULL", "-"}:
-                return False
-            return True
+
+            s = v.strip()
+
+            # Formatos esperados de data vindos da origem/planilha.
+            padroes_data = (
+                r"^\\d{2}/\\d{2}/\\d{4}$",          # 31/08/2026
+                r"^\\d{4}-\\d{2}-\\d{2}$",          # 2026-08-31
+                r"^\\d{2}/\\d{2}/\\d{4}\\s+\\d{2}:\\d{2}",  # data + hora
+                r"^\\d{4}-\\d{2}-\\d{2}[T\\s]\\d{2}:\\d{2}", # ISO/data + hora
+            )
+            return any(re.match(p, s) for p in padroes_data)
 
         def to_float(value):
             if value in (None, ""):
@@ -896,6 +905,14 @@ def build_base_test():
             "nfs_consolidadas": len(rows),
             "nfs_com_id_nf": sum(1 for r in rows if clean(r[2])),
             "nfs_com_num_nf": sum(1 for r in rows if clean(r[4])),
+            "nfs_com_data_cancelamento_reconhecida": sum(
+                1 for nf in nfs.values() if is_cancelada(nf["DATA_CANCELAMENTO"])
+            ),
+            "amostra_data_cancelamento_origem": sorted({
+                clean(nf["DATA_CANCELAMENTO"])
+                for nf in nfs.values()
+                if clean(nf["DATA_CANCELAMENTO"])
+            })[:10],
             "itens": resumo_itens,
             "nfs": resumo_nfs,
             "faturamento_aprovado": faturamento_aprovado,
