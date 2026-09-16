@@ -753,8 +753,8 @@ def load_test_pedidos(limit: int = 5, offset: int = 0):
             id_pedido = clean(row.get("ID_PEDIDO"))
             num_nf = clean(row.get("NUM_NF"))
 
-            if not id_pedido:
-                continue
+            if not id_pedido or id_pedido == "0":
+                       continue
 
             pedidos_nfs.setdefault(id_pedido, set())
 
