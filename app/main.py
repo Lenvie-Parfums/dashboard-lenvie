@@ -64,7 +64,7 @@ def test_sheets():
 
         # Faz uma leitura real para confirmar que a Service Account
         # tem acesso à planilha.
-        values = sheets.read_values("CONFIG!A1:B5")
+        values = sheets.get("CONFIG!A1:B5")
 
         return {
             "status": "ok",
