@@ -497,12 +497,38 @@ def build_base_test():
     try:
         sheets = get_sheets_client()
         values = sheets.get("OMIE_NF!A1:AF50000")
-        itens = rows_to_objects(values)
 
-        if not itens:
+        if not values or not values[0]:
+            return {"status": "error", "error": "A aba OMIE_NF está vazia. BASE_VENDAS não foi alterada."}
+
+        origem_headers = [clean(h) for h in values[0]]
+        obrigatorias_origem = [
+            "ID_NF", "CHAVE_NFE", "NUM_NF", "SERIE", "DATA_EMISSAO",
+            "ID_PEDIDO", "COD_CLIENTE", "CLIENTE_NOME", "CFOP",
+            "VALOR_PRODUTO", "DESCONTO_ITEM", "VALOR_NF",
+        ]
+        faltantes_origem = [h for h in obrigatorias_origem if h not in origem_headers]
+        if faltantes_origem:
             return {
                 "status": "error",
-                "error": "A aba OMIE_NF está vazia. Execute primeiro a carga controlada.",
+                "error": "OMIE_NF sem colunas obrigatórias. BASE_VENDAS não foi alterada.",
+                "colunas_faltantes": faltantes_origem,
+                "cabecalho_omie_nf": origem_headers,
+            }
+
+        itens = rows_to_objects(values)
+        if not itens:
+            return {"status": "error", "error": "OMIE_NF sem linhas de dados. BASE_VENDAS não foi alterada."}
+
+        itens_com_id_nf = sum(1 for x in itens if clean(x.get("ID_NF")))
+        itens_com_num_nf = sum(1 for x in itens if clean(x.get("NUM_NF")))
+        if itens_com_id_nf == 0 or itens_com_num_nf == 0:
+            return {
+                "status": "error",
+                "error": "OMIE_NF está sem ID_NF ou NUM_NF populados. BASE_VENDAS não foi alterada.",
+                "itens_origem": len(itens),
+                "itens_com_id_nf": itens_com_id_nf,
+                "itens_com_num_nf": itens_com_num_nf,
             }
 
         CFOPS_VENDA = {
@@ -663,6 +689,18 @@ def build_base_test():
 
         rows.sort(key=lambda r: (r[0], r[1], r[4]))
 
+        # Não grava uma consolidação que perdeu a identificação fiscal.
+        linhas_sem_id_nf = [r for r in rows if not clean(r[2])]
+        linhas_sem_num_nf = [r for r in rows if not clean(r[4])]
+        if linhas_sem_id_nf or linhas_sem_num_nf:
+            return {
+                "status": "error",
+                "error": "Falha de integridade na consolidação. BASE_VENDAS não foi alterada.",
+                "nfs_consolidadas": len(rows),
+                "linhas_sem_id_nf": len(linhas_sem_id_nf),
+                "linhas_sem_num_nf": len(linhas_sem_num_nf),
+            }
+
         headers = [
             "COMPETENCIA", "DATA_EMISSAO", "ID_NF", "CHAVE_NFE", "NUM_NF",
             "SERIE", "ID_PEDIDO", "NUM_PEDIDO", "COD_CLIENTE", "CNPJ_CPF",
@@ -725,6 +763,8 @@ def build_base_test():
             "message": "BASE_VENDAS reconstruída com classificação por item/CFOP.",
             "itens_origem": len(itens),
             "nfs_consolidadas": len(rows),
+            "nfs_com_id_nf": sum(1 for r in rows if clean(r[2])),
+            "nfs_com_num_nf": sum(1 for r in rows if clean(r[4])),
             "itens": resumo_itens,
             "nfs": resumo_nfs,
             "faturamento_aprovado": faturamento_aprovado,
@@ -1215,19 +1255,17 @@ def dashboard_executive_kpis(
         faturamento = round(sum(to_float(r.get("VALOR_COMERCIAL")) for r in selecionadas), 2)
         clientes = {clean(r.get("CNPJ_CPF")) or clean(r.get("COD_CLIENTE")) for r in selecionadas}
         clientes.discard("")
-        # BASE_VENDAS possui UMA LINHA POR NF comercial.
-        # Tenta deduplicar pelos identificadores disponíveis; se a base atual
-        # estiver com ID_NF/NUM_NF vazios, usa a própria linha como NF.
-        # Isso evita retornar 0 NFs quando já existe faturamento aprovado.
+        # Ticket só pode usar uma identificação fiscal real.
+        # Nunca usa número da linha como se fosse NF.
         nfs = set()
-        for idx, r in enumerate(selecionadas):
+        for r in selecionadas:
             nf_key = (
                 clean(r.get("ID_NF"))
                 or clean(r.get("CHAVE_NFE"))
                 or clean(r.get("NUM_NF"))
-                or f"ROW:{idx}"
             )
-            nfs.add(nf_key)
+            if nf_key:
+                nfs.add(nf_key)
 
         venda_media = round(faturamento / len(clientes), 2) if clientes else 0.0
         ticket_medio = round(faturamento / len(nfs), 2) if nfs else 0.0
