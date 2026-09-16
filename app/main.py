@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from app.services.sync import SyncService
 from app.sheets.client import SheetsClient
+from app.omie.client import OmieClient
 
 
 app = FastAPI(
@@ -13,14 +14,22 @@ app = FastAPI(
 )
 
 
+# ============================================================
+# ROOT
+# ============================================================
+
 @app.get("/")
 def root():
     return {
         "status": "ok",
-        "service": "Lenvie Commercial KPIs",
-        "architecture": "render+sheets-v1",
+        "service": "KPIs comerciais da Lenvie",
+        "arquitetura": "render+sheets-v1",
     }
 
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/health")
 def health():
@@ -30,14 +39,20 @@ def health():
     }
 
 
+# ============================================================
+# TESTE GOOGLE SHEETS
+# ============================================================
+
 @app.get("/sheets/test")
 def test_sheets():
     """
     Testa:
-    Render -> Service Account -> Google Sheets.
+    Render -> Google Service Account -> Google Sheets
 
-    Não consulta o Omie e não altera a planilha.
+    Não consulta o Omie.
+    Não altera a planilha.
     """
+
     try:
         google_sa_json = os.getenv("GOOGLE_SA_JSON")
         spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
@@ -54,7 +69,6 @@ def test_sheets():
                 "error": "Variável GOOGLE_SPREADSHEET_ID não configurada.",
             }
 
-        # GOOGLE_SA_JSON está armazenado no Render como texto JSON.
         service_account_info = json.loads(google_sa_json)
 
         sheets = SheetsClient(
@@ -62,8 +76,7 @@ def test_sheets():
             spreadsheet_id=spreadsheet_id,
         )
 
-        # Faz uma leitura real para confirmar que a Service Account
-        # tem acesso à planilha.
+        # Apenas leitura.
         values = sheets.get("CONFIG!A1:B5")
 
         return {
@@ -88,14 +101,98 @@ def test_sheets():
         }
 
 
+# ============================================================
+# TESTE OMIE
+# ============================================================
+
+@app.get("/omie/test")
+def test_omie():
+    """
+    Testa:
+    Render -> API Omie
+
+    Busca somente 1 cliente para validar:
+    - APP_KEY_OMIE
+    - APP_SECRET_OMIE
+    - comunicação com a API
+
+    Não grava nada no Sheets.
+    """
+
+    try:
+        app_key = os.getenv("APP_KEY_OMIE")
+        app_secret = os.getenv("APP_SECRET_OMIE")
+
+        if not app_key:
+            return {
+                "status": "error",
+                "error": "Variável APP_KEY_OMIE não configurada.",
+            }
+
+        if not app_secret:
+            return {
+                "status": "error",
+                "error": "Variável APP_SECRET_OMIE não configurada.",
+            }
+
+        omie = OmieClient(
+            app_key=app_key,
+            app_secret=app_secret,
+        )
+
+        endpoint = (
+            "https://app.omie.com.br/"
+            "api/v1/geral/clientes/"
+        )
+
+        resposta = omie.call(
+            endpoint=endpoint,
+            call="ListarClientes",
+            param={
+                "pagina": 1,
+                "registros_por_pagina": 1,
+                "apenas_importado_api": "N",
+            },
+        )
+
+        # Não devolvemos dados do cliente.
+        # Apenas informações gerais da consulta.
+        return {
+            "status": "ok",
+            "message": "Conexão com Omie realizada com sucesso.",
+            "pagina": resposta.get("pagina"),
+            "total_de_paginas": resposta.get("total_de_paginas"),
+            "total_de_registros": resposta.get("total_de_registros"),
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+# ============================================================
+# SINCRONIZAÇÃO
+# ============================================================
+
 @app.post("/sync")
 def run_sync():
     """
-    Executa:
-    Omie -> processamento -> Google Sheets.
+    Executa a sincronização completa:
+
+    Omie
+      ->
+    processamento
+      ->
+    Google Sheets
+
+    Esta rota ALTERA a planilha.
     """
+
     try:
         service = SyncService()
+
         result = service.run()
 
         return {
