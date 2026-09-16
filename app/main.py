@@ -1019,14 +1019,21 @@ def load_test_pedidos(limit: int = 5, offset: int = 0):
 def debug_consultar_pedido():
     """Diagnostica ConsultarPedido sem alterar o Google Sheets."""
     try:
-        s = get_settings()
+        app_key = os.getenv("APP_KEY_OMIE")
+        app_secret = os.getenv("APP_SECRET_OMIE")
+
+        if not app_key:
+            raise RuntimeError("Variável APP_KEY_OMIE não configurada.")
+        if not app_secret:
+            raise RuntimeError("Variável APP_SECRET_OMIE não configurada.")
+
         codigo_pedido = 9204861332
         endpoint = ENDPOINTS["pedidos"]
 
         payload = {
             "call": "ConsultarPedido",
-            "app_key": s.omie_app_key,
-            "app_secret": s.omie_app_secret,
+            "app_key": app_key,
+            "app_secret": app_secret,
             "param": [{"codigo_pedido": codigo_pedido}],
         }
 
