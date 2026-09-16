@@ -718,144 +718,227 @@ def build_base_test():
 
 
 # ============================================================
-# TESTE CONTROLADO DE PEDIDOS OMIE
+# CONSULTA DIRETA DOS PEDIDOS VINCULADOS ÀS NFs
 # ============================================================
 
 @app.get("/omie/pedidos/load-test")
 def load_test_pedidos():
     """
-    Carga controlada de pedidos de 01/08/2026 a 03/08/2026.
+    Lê os ID_PEDIDO já existentes em OMIE_NF e consulta
+    diretamente cada pedido no Omie usando ConsultarPedido.
 
-    Grava somente na aba OMIE_PEDIDOS_TESTE.
+    Grava somente OMIE_PEDIDOS_TESTE.
     Não altera OMIE_NF, BASE_VENDAS ou KPIs.
     """
     try:
         omie = get_omie_client()
         sheets = get_sheets_client()
 
-        data_inicial = "01/08/2026"
-        data_final = "03/08/2026"
+        nf_values = sheets.get("OMIE_NF!A1:AF50000")
+        nf_rows = rows_to_objects(nf_values)
 
-        todos_pedidos = []
-        pagina = 1
-        total_paginas = 1
+        if not nf_rows:
+            return {
+                "status": "error",
+                "error": "A aba OMIE_NF está vazia.",
+            }
 
-        while pagina <= total_paginas:
-            resposta = omie.call(
-                endpoint=ENDPOINTS["pedidos"],
-                call="ListarPedidos",
-                param={
-                    "pagina": pagina,
-                    "registros_por_pagina": 100,
-                    "filtrar_por_data_de": data_inicial,
-                    "filtrar_por_data_ate": data_final,
-                },
-            )
+        # ID_PEDIDO -> NFs vinculadas
+        pedidos_nfs = {}
 
-            pedidos = (
-                resposta.get("pedido_venda_produto")
-                or resposta.get("pedidos")
-                or resposta.get("pedidoVendaProduto")
-                or []
-            )
+        for row in nf_rows:
+            id_pedido = clean(row.get("ID_PEDIDO"))
+            num_nf = clean(row.get("NUM_NF"))
 
-            todos_pedidos.extend(pedidos)
+            if not id_pedido:
+                continue
 
-            total_paginas = int(
-                resposta.get("total_de_paginas")
-                or resposta.get("total_paginas")
-                or 1
-            )
+            pedidos_nfs.setdefault(id_pedido, set())
 
-            pagina += 1
+            if num_nf:
+                pedidos_nfs[id_pedido].add(num_nf)
+
+        ids_pedidos = sorted(pedidos_nfs.keys())
+
+        if not ids_pedidos:
+            return {
+                "status": "error",
+                "error": "Nenhum ID_PEDIDO encontrado na OMIE_NF.",
+            }
 
         rows = []
+        erros = []
+        categorias = set()
+        origens = set()
+        vendedores = set()
+        etapas = set()
 
-        for pedido in todos_pedidos:
-            cab = pedido.get("cabecalho") or {}
-            info = (
-                pedido.get("infoCadastro")
-                or pedido.get("info_cadastro")
-                or {}
-            )
-            total = (
-                pedido.get("total_pedido")
-                or pedido.get("totalPedido")
-                or {}
-            )
+        for id_pedido in ids_pedidos:
+            try:
+                # A documentação do Omie define ConsultarPedido
+                # com o parâmetro codigo_pedido.
+                pedido = omie.call(
+                    endpoint=ENDPOINTS["pedidos"],
+                    call="ConsultarPedido",
+                    param={
+                        "codigo_pedido": int(id_pedido)
+                    },
+                )
 
-            codigo_pedido = (
-                cab.get("codigo_pedido")
-                or cab.get("codigo_pedido_omie")
-                or ""
-            )
+                cab = pedido.get("cabecalho") or {}
 
-            numero_pedido = cab.get("numero_pedido") or ""
-            codigo_cliente = cab.get("codigo_cliente") or ""
-            codigo_vendedor = cab.get("codigo_vendedor") or ""
+                info_adic = (
+                    pedido.get("informacoes_adicionais")
+                    or {}
+                )
 
-            codigo_categoria = (
-                cab.get("codigo_categoria")
-                or cab.get("categoria")
-                or ""
-            )
+                total = (
+                    pedido.get("total_pedido")
+                    or pedido.get("totalPedido")
+                    or {}
+                )
 
-            etapa = cab.get("etapa") or ""
+                info_cadastro = (
+                    pedido.get("infoCadastro")
+                    or pedido.get("info_cadastro")
+                    or {}
+                )
 
-            status = (
-                cab.get("status_pedido")
-                or cab.get("status")
-                or ""
-            )
+                codigo_pedido = (
+                    cab.get("codigo_pedido")
+                    or id_pedido
+                )
 
-            data_pedido = (
-                cab.get("data_previsao")
-                or cab.get("data_pedido")
-                or info.get("dInc")
-                or ""
-            )
+                numero_pedido = (
+                    cab.get("numero_pedido")
+                    or ""
+                )
 
-            valor_pedido = (
-                total.get("valor_total_pedido")
-                or total.get("valor_total")
-                or total.get("total_valor")
-                or 0
-            )
+                codigo_cliente = (
+                    cab.get("codigo_cliente")
+                    or ""
+                )
 
-            # Guardamos somente os nomes dos campos para diagnóstico,
-            # evitando JSON bruto grande em uma célula do Sheets.
-            campos_raiz = ";".join(sorted(pedido.keys()))
-            campos_cabecalho = ";".join(sorted(cab.keys()))
+                codigo_vendedor = (
+                    cab.get("codigo_vendedor")
+                    or info_adic.get("codigo_vendedor")
+                    or ""
+                )
 
-            rows.append([
-                codigo_pedido,
-                numero_pedido,
-                data_pedido,
-                codigo_cliente,
-                codigo_vendedor,
-                codigo_categoria,
-                etapa,
-                status,
-                valor_pedido,
-                campos_raiz,
-                campos_cabecalho,
-            ])
+                codigo_categoria = (
+                    info_adic.get("codigo_categoria")
+                    or cab.get("codigo_categoria")
+                    or cab.get("categoria")
+                    or ""
+                )
+
+                origem_pedido = (
+                    cab.get("origem_pedido")
+                    or ""
+                )
+
+                etapa = cab.get("etapa") or ""
+
+                encerrado = (
+                    cab.get("encerrado")
+                    or ""
+                )
+
+                motivo_encerramento = (
+                    cab.get("enc_motivo")
+                    or ""
+                )
+
+                data_previsao = (
+                    cab.get("data_previsao")
+                    or ""
+                )
+
+                valor_mercadorias = (
+                    total.get("valor_mercadorias")
+                    or 0
+                )
+
+                valor_total_pedido = (
+                    total.get("valor_total_pedido")
+                    or total.get("valor_total")
+                    or 0
+                )
+
+                qtd_itens = (
+                    cab.get("quantidade_itens")
+                    or len(pedido.get("det") or [])
+                    or 0
+                )
+
+                nfs_vinculadas = ";".join(
+                    sorted(pedidos_nfs.get(id_pedido, set()))
+                )
+
+                if codigo_categoria:
+                    categorias.add(str(codigo_categoria))
+
+                if origem_pedido:
+                    origens.add(str(origem_pedido))
+
+                if codigo_vendedor:
+                    vendedores.add(str(codigo_vendedor))
+
+                if etapa:
+                    etapas.add(str(etapa))
+
+                rows.append([
+                    codigo_pedido,
+                    numero_pedido,
+                    nfs_vinculadas,
+                    data_previsao,
+                    codigo_cliente,
+                    codigo_vendedor,
+                    codigo_categoria,
+                    origem_pedido,
+                    etapa,
+                    encerrado,
+                    motivo_encerramento,
+                    qtd_itens,
+                    valor_mercadorias,
+                    valor_total_pedido,
+                    ";".join(sorted(pedido.keys())),
+                    ";".join(sorted(cab.keys())),
+                    ";".join(sorted(info_adic.keys())),
+                    ";".join(sorted(info_cadastro.keys())),
+                ])
+
+            except Exception as exc:
+                erros.append({
+                    "id_pedido": id_pedido,
+                    "erro": str(exc)[:500],
+                })
 
         headers = [
             "COD_PEDIDO",
             "NUM_PEDIDO",
-            "DATA_PEDIDO",
+            "NFS_VINCULADAS",
+            "DATA_PREVISAO",
             "COD_CLIENTE",
             "COD_VENDEDOR",
             "CATEGORIA",
+            "ORIGEM_PEDIDO",
             "ETAPA",
-            "STATUS",
-            "VALOR_PEDIDO",
+            "ENCERRADO",
+            "MOTIVO_ENCERRAMENTO",
+            "QTD_ITENS",
+            "VALOR_MERCADORIAS",
+            "VALOR_TOTAL_PEDIDO",
             "CAMPOS_RAIZ",
             "CAMPOS_CABECALHO",
+            "CAMPOS_INFO_ADIC",
+            "CAMPOS_INFO_CADASTRO",
         ]
 
-        get_or_create_sheet(sheets, "OMIE_PEDIDOS_TESTE")
+        get_or_create_sheet(
+            sheets,
+            "OMIE_PEDIDOS_TESTE",
+        )
 
         (
             sheets.api
@@ -863,7 +946,7 @@ def load_test_pedidos():
             .values()
             .clear(
                 spreadsheetId=sheets.spreadsheet_id,
-                range="'OMIE_PEDIDOS_TESTE'!A:K",
+                range="'OMIE_PEDIDOS_TESTE'!A:R",
                 body={},
             )
             .execute()
@@ -882,29 +965,20 @@ def load_test_pedidos():
             .execute()
         )
 
-        categorias = sorted({
-            str(row[5])
-            for row in rows
-            if row[5] not in (None, "")
-        })
-
-        vendedores = sorted({
-            str(row[4])
-            for row in rows
-            if row[4] not in (None, "")
-        })
-
         return {
             "status": "ok",
-            "message": "Carga controlada de pedidos realizada.",
-            "periodo": {
-                "inicio": data_inicial,
-                "fim": data_final,
-            },
-            "pedidos_recebidos": len(todos_pedidos),
-            "pedidos_gravados": len(rows),
-            "categorias_encontradas": categorias,
+            "message": (
+                "Pedidos vinculados às NFs consultados diretamente "
+                "com ConsultarPedido."
+            ),
+            "ids_pedido_encontrados_na_omie_nf": len(ids_pedidos),
+            "pedidos_consultados_com_sucesso": len(rows),
+            "pedidos_com_erro": len(erros),
+            "categorias_encontradas": sorted(categorias),
+            "origens_encontradas": sorted(origens),
+            "etapas_encontradas": sorted(etapas),
             "vendedores_encontrados": len(vendedores),
+            "erros_amostra": erros[:10],
             "aba_destino": "OMIE_PEDIDOS_TESTE",
         }
 
