@@ -4,7 +4,6 @@ import os
 from datetime import datetime
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
 
 from app.sheets.client import SheetsClient
 from app.omie.client import OmieClient
@@ -330,6 +329,128 @@ def test_omie_nfe():
 # ============================================================
 # CARGA CONTROLADA NF -> OMIE_NF
 # ============================================================
+
+
+@app.get("/omie/nfe/load-month")
+def load_nfe_month(ano: int = 2026, mes: int = 1):
+    """
+    Carga histórica controlada de UM mês.
+    Faz merge por ID_NF + ID_ITEM na OMIE_NF, portanto não apaga os meses já carregados.
+    Não reconstrói BASE_VENDAS automaticamente.
+    """
+    import calendar
+
+    if ano < 2020 or ano > 2100 or mes < 1 or mes > 12:
+        return {"status": "error", "error": "Ano/mês inválido."}
+
+    try:
+        omie = get_omie_client()
+        sheets = get_sheets_client()
+
+        ultimo_dia = calendar.monthrange(ano, mes)[1]
+        data_inicial = f"01/{mes:02d}/{ano}"
+        data_final = f"{ultimo_dia:02d}/{mes:02d}/{ano}"
+
+        todas_notas = []
+        pagina = 1
+        total_paginas = 1
+
+        while pagina <= total_paginas:
+            resposta = omie.call(
+                endpoint=ENDPOINTS["nfe"],
+                call="ListarNF",
+                param={
+                    "pagina": pagina,
+                    "registros_por_pagina": 100,
+                    "dEmiInicial": data_inicial,
+                    "dEmiFinal": data_final,
+                },
+            )
+            todas_notas.extend(resposta.get("nfCadastro") or [])
+            total_paginas = int(resposta.get("total_de_paginas") or 1)
+            pagina += 1
+
+        novas_rows = normalize_nfe(todas_notas)
+
+        headers = [
+            "ID_NF","CHAVE_NFE","NUM_NF","SERIE","DATA_EMISSAO","TIPO_NF",
+            "DATA_CANCELAMENTO","ID_PEDIDO","NUM_PEDIDO","COD_CLIENTE","CNPJ_CPF",
+            "CLIENTE_NOME","COD_VENDEDOR","CATEGORIA","ID_ITEM","COD_PRODUTO_OMIE",
+            "SKU","PRODUTO","CFOP","NCM","QUANTIDADE","UNIDADE","VALOR_UNITARIO",
+            "VALOR_PRODUTO","DESCONTO_ITEM","FRETE_ITEM","OUTROS_ITEM",
+            "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
+        ]
+
+        get_or_create_sheet(sheets, "OMIE_NF")
+        atual = sheets.get("OMIE_NF!A1:AF50000")
+
+        existentes = []
+        if atual:
+            cab = [clean(x) for x in atual[0]]
+            if cab != headers:
+                return {
+                    "status":"error",
+                    "error":"Cabeçalho da OMIE_NF diferente do contrato. Nada foi alterado.",
+                    "cabecalho_atual":cab,
+                    "cabecalho_esperado":headers,
+                }
+            existentes = atual[1:]
+
+        # Remove do conjunto atual somente o mês que está sendo recarregado.
+        # Assim a execução é idempotente: pode repetir o mesmo mês sem duplicar.
+        def pertence_ao_mes(row):
+            if len(row) <= 4:
+                return False
+            d = clean(row[4])
+            dt = parse_br_date(d)
+            return bool(dt and dt.year == ano and dt.month == mes)
+
+        preservadas = [r for r in existentes if not pertence_ao_mes(r)]
+
+        # Deduplica a carga do mês por NF + item; se ID_ITEM faltar, usa posição fiscal/produto.
+        dedup = {}
+        for r in novas_rows:
+            id_nf = clean(r[0]) if len(r) > 0 else ""
+            id_item = clean(r[14]) if len(r) > 14 else ""
+            fallback = "|".join([
+                clean(r[16]) if len(r) > 16 else "",
+                clean(r[18]) if len(r) > 18 else "",
+                clean(r[23]) if len(r) > 23 else "",
+            ])
+            chave = f"{id_nf}|{id_item or fallback}"
+            dedup[chave] = r
+
+        consolidadas = preservadas + list(dedup.values())
+
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'OMIE_NF'!A:AF",
+            body={},
+        ).execute()
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'OMIE_NF'!A1",
+            valueInputOption="RAW",
+            body={"values":[headers] + consolidadas},
+        ).execute()
+
+        nfs_mes = {clean(r[0]) for r in dedup.values() if r and clean(r[0])}
+        cfops_mes = sorted({clean(r[18]) for r in dedup.values() if len(r)>18 and clean(r[18])})
+
+        return {
+            "status":"ok",
+            "message":"Mês carregado na OMIE_NF sem apagar os demais meses.",
+            "periodo":{"inicio":data_inicial,"fim":data_final},
+            "nfs_recebidas_api":len(todas_notas),
+            "nfs_unicas_mes":len(nfs_mes),
+            "itens_mes":len(dedup),
+            "linhas_preservadas_outros_meses":len(preservadas),
+            "total_itens_omie_nf":len(consolidadas),
+            "cfops_mes":cfops_mes,
+            "proximo_passo":"Carregar o próximo mês; reconstruir BASE_VENDAS somente ao final.",
+        }
+    except Exception as e:
+        return {"status":"error","error":repr(e)}
 
 @app.get("/omie/nfe/load-test")
 def load_test_nfe():
@@ -1436,25 +1557,3 @@ def dashboard_executive_kpis(
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
-
-
-# ============================================================
-# FRONTEND V10
-# ============================================================
-
-@app.get("/dashboard", include_in_schema=False)
-def dashboard_frontend():
-    """Entrega o dashboard HTML V10 sem alterar os endpoints da API."""
-    from pathlib import Path
-
-    index_path = Path(__file__).resolve().parent.parent / "static" / "index.html"
-
-    if not index_path.exists():
-        return {
-            "status": "error",
-            "error": "Frontend não encontrado.",
-            "arquivo_esperado": "static/index.html",
-        }
-
-    return FileResponse(index_path, media_type="text/html")
-
