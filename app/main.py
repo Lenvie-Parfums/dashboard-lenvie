@@ -504,8 +504,19 @@ def build_base_test():
                 "error": "A aba OMIE_NF está vazia. Execute primeiro a carga controlada.",
             }
 
-        CFOPS_VENDA = {"5101", "5102", "6101", "6102", "6401"}
-        CFOPS_EXCLUIR = {"5910", "6910"}
+        CFOPS_VENDA = {
+    "5101",
+    "6101",
+    "5102",
+    "6102",
+    "5910",
+    "6910",
+    "5403",
+    "6403",
+    "6109",
+    "6110",
+}
+        CFOPS_EXCLUIR = set()
 
         def to_float(value):
             if value in (None, ""):
