@@ -1131,8 +1131,19 @@ def dashboard_executive_kpis(
         faturamento = round(sum(to_float(r.get("VALOR_COMERCIAL")) for r in selecionadas), 2)
         clientes = {clean(r.get("CNPJ_CPF")) or clean(r.get("COD_CLIENTE")) for r in selecionadas}
         clientes.discard("")
-        nfs = {clean(r.get("ID_NF")) or clean(r.get("NUM_NF")) for r in selecionadas}
-        nfs.discard("")
+        # BASE_VENDAS possui UMA LINHA POR NF comercial.
+        # Tenta deduplicar pelos identificadores disponíveis; se a base atual
+        # estiver com ID_NF/NUM_NF vazios, usa a própria linha como NF.
+        # Isso evita retornar 0 NFs quando já existe faturamento aprovado.
+        nfs = set()
+        for idx, r in enumerate(selecionadas):
+            nf_key = (
+                clean(r.get("ID_NF"))
+                or clean(r.get("CHAVE_NFE"))
+                or clean(r.get("NUM_NF"))
+                or f"ROW:{idx}"
+            )
+            nfs.add(nf_key)
 
         venda_media = round(faturamento / len(clientes), 2) if clientes else 0.0
         ticket_medio = round(faturamento / len(nfs), 2) if nfs else 0.0
