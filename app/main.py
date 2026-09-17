@@ -333,6 +333,174 @@ def test_omie_nfe():
 
 
 
+
+@app.get("/omie/nfe/sync-historico-step")
+def sync_historico_step():
+    """
+    Processa UMA página por execução e salva o cursor em OMIE_SYNC_CONTROLE.
+    Início padrão: Fev/2026 página 2 (página 1 já validada).
+    Ao terminar um mês, avança automaticamente para o próximo.
+    Para em Ago/2026.
+    Não altera BASE_VENDAS.
+    """
+    import calendar
+
+    try:
+        sheets = get_sheets_client()
+        controle_aba = "OMIE_SYNC_CONTROLE"
+        get_or_create_sheet(sheets, controle_aba)
+
+        controle = sheets.get(f"{controle_aba}!A1:F10")
+        headers_ctrl = ["ANO", "MES", "PAGINA", "STATUS", "ATUALIZADO_EM", "ULTIMO_ERRO"]
+
+        # Inicialização segura conforme o ponto já validado nesta conversa.
+        ano, mes, pagina = 2026, 2, 2
+        if controle and len(controle) >= 2:
+            cab = [clean(x) for x in controle[0]]
+            if cab == headers_ctrl:
+                row = controle[1]
+                try:
+                    ano = int(clean(row[0]) or 2026)
+                    mes = int(clean(row[1]) or 2)
+                    pagina = int(clean(row[2]) or 2)
+                except Exception:
+                    pass
+
+        if ano > 2026 or (ano == 2026 and mes > 8):
+            return {
+                "status": "ok",
+                "finalizado": True,
+                "message": "Carga histórica Fev–Ago/2026 concluída.",
+                "base_vendas_alterada": False,
+            }
+
+        # Reutiliza a mesma lógica validada da rota paginada, mas sem chamada HTTP interna.
+        omie = get_omie_client()
+        ultimo_dia = calendar.monthrange(ano, mes)[1]
+        data_inicial = f"01/{mes:02d}/{ano}"
+        data_final = f"{ultimo_dia:02d}/{mes:02d}/{ano}"
+
+        resposta = omie.call(
+            endpoint=ENDPOINTS["nfe"],
+            call="ListarNF",
+            param={
+                "pagina": pagina,
+                "registros_por_pagina": 100,
+                "dEmiInicial": data_inicial,
+                "dEmiFinal": data_final,
+            },
+        )
+
+        notas = resposta.get("nfCadastro") or []
+        total_paginas = int(resposta.get("total_de_paginas") or 1)
+        novas_rows = normalize_nfe(notas)
+
+        headers = [
+            "ID_NF","CHAVE_NFE","NUM_NF","SERIE","DATA_EMISSAO","TIPO_NF",
+            "DATA_CANCELAMENTO","ID_PEDIDO","NUM_PEDIDO","COD_CLIENTE","CNPJ_CPF",
+            "CLIENTE_NOME","COD_VENDEDOR","CATEGORIA","ID_ITEM","COD_PRODUTO_OMIE",
+            "SKU","PRODUTO","CFOP","NCM","QUANTIDADE","UNIDADE","VALOR_UNITARIO",
+            "VALOR_PRODUTO","DESCONTO_ITEM","FRETE_ITEM","OUTROS_ITEM",
+            "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
+        ]
+
+        atual = sheets.get("OMIE_NF!A1:AF50000")
+        existentes = []
+        if atual:
+            cab = [clean(x) for x in atual[0]]
+            if cab != headers:
+                return {
+                    "status": "error",
+                    "error": "Cabeçalho da OMIE_NF diferente do contrato. Nada foi alterado.",
+                }
+            existentes = atual[1:]
+
+        def row_key(r):
+            id_nf = clean(r[0]) if len(r) > 0 else ""
+            id_item = clean(r[14]) if len(r) > 14 else ""
+            fallback = "|".join([
+                clean(r[16]) if len(r) > 16 else "",
+                clean(r[18]) if len(r) > 18 else "",
+                clean(r[23]) if len(r) > 23 else "",
+                clean(r[20]) if len(r) > 20 else "",
+            ])
+            return f"{id_nf}|{id_item or fallback}"
+
+        merged = {row_key(r): r for r in existentes if r}
+        chaves_antes = set(merged)
+        for r in novas_rows:
+            if r:
+                merged[row_key(r)] = r
+        consolidadas = list(merged.values())
+        itens_novos = len(set(merged) - chaves_antes)
+
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'OMIE_NF'!A:AF",
+            body={},
+        ).execute()
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'OMIE_NF'!A1",
+            valueInputOption="RAW",
+            body={"values": [headers] + consolidadas},
+        ).execute()
+
+        # Avança cursor somente após a gravação bem-sucedida.
+        if pagina >= total_paginas:
+            prox_mes = mes + 1
+            prox_pagina = 1
+        else:
+            prox_mes = mes
+            prox_pagina = pagina + 1
+
+        finalizado = prox_mes > 8
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        ctrl_row = [
+            2026,
+            9 if finalizado else prox_mes,
+            1 if finalizado else prox_pagina,
+            "FINALIZADO" if finalizado else "EM_ANDAMENTO",
+            now,
+            "",
+        ]
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id,
+            range=f"'{controle_aba}'!A:F",
+            body={},
+        ).execute()
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,
+            range=f"'{controle_aba}'!A1",
+            valueInputOption="RAW",
+            body={"values": [headers_ctrl, ctrl_row]},
+        ).execute()
+
+        return {
+            "status": "ok",
+            "processado": {"ano": ano, "mes": mes, "pagina": pagina},
+            "total_paginas_mes": total_paginas,
+            "nfs_recebidas": len(notas),
+            "itens_pagina": len(novas_rows),
+            "itens_realmente_novos": itens_novos,
+            "total_itens_omie_nf": len(consolidadas),
+            "proximo": None if finalizado else {
+                "ano": 2026, "mes": prox_mes, "pagina": prox_pagina
+            },
+            "finalizado": finalizado,
+            "base_vendas_alterada": False,
+            "controle": controle_aba,
+        }
+
+    except Exception as e:
+        # Não avança cursor em caso de erro; próxima execução repete a mesma página.
+        return {
+            "status": "error",
+            "error": repr(e),
+            "message": "Cursor não avançou; a mesma página poderá ser repetida com segurança.",
+        }
+
 @app.get("/omie/nfe/diagnostico-local")
 def diagnostico_omie_nf_local(ano: int = 2026):
     """
