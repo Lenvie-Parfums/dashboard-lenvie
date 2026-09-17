@@ -459,17 +459,14 @@ def sync_2025_step():
             "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
         ]
 
-        atual = sheets.get("OMIE_NF!A:AF")
-        existentes = []
-        if atual:
-            cab = [clean(x) for x in atual[0]]
-            if cab != headers:
-                return {
-                    "status": "error",
-                    "error": "Cabeçalho da OMIE_NF diferente do contrato. Nada foi alterado.",
-                    "controle": controle_aba,
-                }
-            existentes = atual[1:]
+        # Valida somente o cabeçalho completo.
+        cab_atual = sheets.get("OMIE_NF!A1:AF1")
+        if not cab_atual or [clean(x) for x in cab_atual[0]] != headers:
+            return {
+                "status": "error",
+                "error": "Cabeçalho da OMIE_NF diferente do contrato. Nada foi alterado.",
+                "controle": controle_aba,
+            }
 
         def row_key(r):
             id_nf = clean(r[0]) if len(r) > 0 else ""
@@ -482,17 +479,46 @@ def sync_2025_step():
             ])
             return f"{id_nf}|{id_item or fallback}"
 
-        merged = {row_key(r): r for r in existentes if r}
-        chaves_antes = set(merged)
-        for r in novas_rows:
-            if r:
-                merged[row_key(r)] = r
+        # Deduplicação leve: lê apenas as 6 colunas necessárias para formar
+        # a mesma chave usada acima, em vez de baixar A:AF + RAW_JSON inteiro.
+        ranges_chave = [
+            "'OMIE_NF'!A2:A",   # ID_NF
+            "'OMIE_NF'!O2:O",   # ID_ITEM
+            "'OMIE_NF'!Q2:Q",   # SKU (fallback)
+            "'OMIE_NF'!S2:S",   # CFOP (fallback)
+            "'OMIE_NF'!X2:X",   # VALOR_PRODUTO (fallback)
+            "'OMIE_NF'!U2:U",   # QUANTIDADE (fallback)
+        ]
+        batch = sheets.api.spreadsheets().values().batchGet(
+            spreadsheetId=sheets.spreadsheet_id,
+            ranges=ranges_chave,
+            majorDimension="COLUMNS",
+        ).execute()
 
-        consolidadas = list(merged.values())
-        itens_novos = len(set(merged) - chaves_antes)
+        value_ranges = batch.get("valueRanges") or []
+        colunas = []
+        for vr in value_ranges:
+            vals = vr.get("values") or []
+            colunas.append(vals[0] if vals else [])
+
+        while len(colunas) < 6:
+            colunas.append([])
+
+        total_existente = max((len(c) for c in colunas), default=0)
+        chaves_antes = set()
+
+        for i in range(total_existente):
+            id_nf = clean(colunas[0][i]) if i < len(colunas[0]) else ""
+            id_item = clean(colunas[1][i]) if i < len(colunas[1]) else ""
+            sku = clean(colunas[2][i]) if i < len(colunas[2]) else ""
+            cfop = clean(colunas[3][i]) if i < len(colunas[3]) else ""
+            valor_produto = clean(colunas[4][i]) if i < len(colunas[4]) else ""
+            quantidade = clean(colunas[5][i]) if i < len(colunas[5]) else ""
+            if id_nf:
+                fallback = "|".join([sku, cfop, valor_produto, quantidade])
+                chaves_antes.add(f"{id_nf}|{id_item or fallback}")
 
         # Escrita incremental: adiciona SOMENTE chaves ainda inexistentes.
-        # Não limpa nem regrava a OMIE_NF inteira.
         novas_para_append = []
         chaves_append = set()
         for r in novas_rows:
@@ -512,8 +538,7 @@ def sync_2025_step():
                 body={"values": novas_para_append},
             ).execute()
 
-        # Total lógico após o append, sem reescrever a base.
-        total_apos_append = len(existentes) + len(novas_para_append)
+        total_apos_append = total_existente + len(novas_para_append)
         itens_novos = len(novas_para_append)
 
         if pagina >= total_paginas:
@@ -558,6 +583,7 @@ def sync_2025_step():
             "controle": controle_aba,
             "cursor_2026_alterado": False,
             "modo_gravacao": "incremental_append",
+            "modo_deduplicacao": "chaves_6_colunas",
         }
 
     except Exception as e:
