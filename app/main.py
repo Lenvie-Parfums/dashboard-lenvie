@@ -479,44 +479,44 @@ def sync_2025_step():
             ])
             return f"{id_nf}|{id_item or fallback}"
 
-        # Deduplicação leve: lê apenas as 6 colunas necessárias para formar
-        # a mesma chave usada acima, em vez de baixar A:AF + RAW_JSON inteiro.
-        ranges_chave = [
-            "'OMIE_NF'!A2:A",   # ID_NF
-            "'OMIE_NF'!O2:O",   # ID_ITEM
-            "'OMIE_NF'!Q2:Q",   # SKU (fallback)
-            "'OMIE_NF'!S2:S",   # CFOP (fallback)
-            "'OMIE_NF'!X2:X",   # VALOR_PRODUTO (fallback)
-            "'OMIE_NF'!U2:U",   # QUANTIDADE (fallback)
-        ]
+        # Deduplicação por página:
+        # lê somente ID_NF e ID_ITEM da OMIE_NF existente e mantém em memória
+        # apenas as chaves pertencentes às NFs retornadas pela página atual.
+        # Isso evita materializar 261k+ chaves completas em um set Python.
+        ids_nf_pagina = {
+            clean(r[0]) for r in novas_rows
+            if r and len(r) > 0 and clean(r[0])
+        }
+
         batch = sheets.api.spreadsheets().values().batchGet(
             spreadsheetId=sheets.spreadsheet_id,
-            ranges=ranges_chave,
+            ranges=["'OMIE_NF'!A2:A", "'OMIE_NF'!O2:O"],
             majorDimension="COLUMNS",
         ).execute()
 
         value_ranges = batch.get("valueRanges") or []
-        colunas = []
-        for vr in value_ranges:
-            vals = vr.get("values") or []
-            colunas.append(vals[0] if vals else [])
+        ids_nf_existentes = (
+            (value_ranges[0].get("values") or [[]])[0]
+            if len(value_ranges) > 0 else []
+        )
+        ids_item_existentes = (
+            (value_ranges[1].get("values") or [[]])[0]
+            if len(value_ranges) > 1 else []
+        )
 
-        while len(colunas) < 6:
-            colunas.append([])
-
-        total_existente = max((len(c) for c in colunas), default=0)
+        total_existente = max(len(ids_nf_existentes), len(ids_item_existentes))
         chaves_antes = set()
 
-        for i in range(total_existente):
-            id_nf = clean(colunas[0][i]) if i < len(colunas[0]) else ""
-            id_item = clean(colunas[1][i]) if i < len(colunas[1]) else ""
-            sku = clean(colunas[2][i]) if i < len(colunas[2]) else ""
-            cfop = clean(colunas[3][i]) if i < len(colunas[3]) else ""
-            valor_produto = clean(colunas[4][i]) if i < len(colunas[4]) else ""
-            quantidade = clean(colunas[5][i]) if i < len(colunas[5]) else ""
-            if id_nf:
-                fallback = "|".join([sku, cfop, valor_produto, quantidade])
-                chaves_antes.add(f"{id_nf}|{id_item or fallback}")
+        for i, id_nf_raw in enumerate(ids_nf_existentes):
+            id_nf = clean(id_nf_raw)
+            if not id_nf or id_nf not in ids_nf_pagina:
+                continue
+            id_item = (
+                clean(ids_item_existentes[i])
+                if i < len(ids_item_existentes) else ""
+            )
+            if id_item:
+                chaves_antes.add(f"{id_nf}|{id_item}")
 
         # Escrita incremental: adiciona SOMENTE chaves ainda inexistentes.
         novas_para_append = []
@@ -525,7 +525,9 @@ def sync_2025_step():
             if not r:
                 continue
             k = row_key(r)
-            if k not in chaves_antes and k not in chaves_append:
+            id_item = clean(r[14]) if len(r) > 14 else ""
+            ja_existe = (k in chaves_antes) if id_item else False
+            if not ja_existe and k not in chaves_append:
                 novas_para_append.append(r)
                 chaves_append.add(k)
 
@@ -583,7 +585,7 @@ def sync_2025_step():
             "controle": controle_aba,
             "cursor_2026_alterado": False,
             "modo_gravacao": "incremental_append",
-            "modo_deduplicacao": "chaves_6_colunas",
+            "modo_deduplicacao": "pagina_id_nf_id_item",
         }
 
     except Exception as e:
