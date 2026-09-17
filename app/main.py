@@ -332,6 +332,98 @@ def test_omie_nfe():
 # ============================================================
 
 
+
+@app.get("/omie/nfe/diagnostico-local")
+def diagnostico_omie_nf_local(ano: int = 2026):
+    """
+    Diagnóstico SOMENTE LEITURA da OMIE_NF.
+    Não chama a API Omie e não grava/limpa nenhuma aba.
+    Resume NFs e itens por mês usando DATA_EMISSAO.
+    """
+    try:
+        sheets = get_sheets_client()
+        values = sheets.get("OMIE_NF!A1:AF50000")
+
+        if not values or len(values) < 2:
+            return {
+                "status": "ok",
+                "ano": ano,
+                "total_itens_omie_nf": 0,
+                "meses": [],
+                "modo": "somente_leitura",
+            }
+
+        rows = rows_to_objects(values)
+        meses = {
+            m: {"nfs": set(), "itens": 0, "datas": []}
+            for m in range(1, 13)
+        }
+
+        primeira = None
+        ultima = None
+        fora_ano = 0
+        datas_invalidas = 0
+
+        for r in rows:
+            raw_data = clean(r.get("DATA_EMISSAO"))
+            dt = parse_br_date(raw_data)
+
+            if not dt:
+                datas_invalidas += 1
+                continue
+
+            if primeira is None or dt < primeira:
+                primeira = dt
+            if ultima is None or dt > ultima:
+                ultima = dt
+
+            if dt.year != ano:
+                fora_ano += 1
+                continue
+
+            m = dt.month
+            meses[m]["itens"] += 1
+
+            id_nf = (
+                clean(r.get("ID_NF"))
+                or clean(r.get("CHAVE_NFE"))
+                or clean(r.get("NUM_NF"))
+            )
+            if id_nf:
+                meses[m]["nfs"].add(id_nf)
+
+        nomes = [
+            "", "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+            "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
+        ]
+
+        resumo = []
+        for m in range(1, 13):
+            resumo.append({
+                "mes": m,
+                "nome": nomes[m],
+                "nfs_unicas": len(meses[m]["nfs"]),
+                "itens": meses[m]["itens"],
+            })
+
+        return {
+            "status": "ok",
+            "ano": ano,
+            "primeira_emissao_na_aba": primeira.strftime("%d/%m/%Y") if primeira else None,
+            "ultima_emissao_na_aba": ultima.strftime("%d/%m/%Y") if ultima else None,
+            "total_itens_omie_nf": len(rows),
+            "linhas_do_ano": sum(x["itens"] for x in meses.values()),
+            "linhas_fora_do_ano": fora_ano,
+            "datas_invalidas": datas_invalidas,
+            "meses": resumo,
+            "modo": "somente_leitura",
+            "omie_api_chamada": False,
+            "planilha_alterada": False,
+        }
+
+    except Exception as e:
+        return {"status": "error", "error": repr(e)}
+
 @app.get("/omie/nfe/load-page")
 def load_nfe_page(ano: int = 2026, mes: int = 1, pagina: int = 1):
     """
