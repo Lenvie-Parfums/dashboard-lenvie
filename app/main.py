@@ -501,6 +501,70 @@ def sync_historico_step():
             "message": "Cursor não avançou; a mesma página poderá ser repetida com segurança.",
         }
 
+
+@app.get("/omie/nfe/sync-historico-batch")
+def sync_historico_batch(passos: int = 3, pausa_segundos: int = 8):
+    """
+    Executa poucos passos sequenciais do cursor histórico.
+    Proteções:
+    - máximo de 5 páginas por chamada;
+    - pausa entre páginas;
+    - para imediatamente em qualquer erro;
+    - em erro o próprio sync_historico_step não avança o cursor;
+    - encerra ao atingir FINALIZADO;
+    - não altera BASE_VENDAS.
+    """
+    import time
+
+    passos = max(1, min(int(passos), 5))
+    pausa_segundos = max(5, min(int(pausa_segundos), 60))
+
+    resultados = []
+
+    for i in range(passos):
+        resultado = sync_historico_step()
+        resultados.append(resultado)
+
+        if not isinstance(resultado, dict):
+            return {
+                "status": "error",
+                "message": "Retorno inesperado do passo histórico.",
+                "passos_executados": len(resultados),
+                "resultados": resultados,
+            }
+
+        if resultado.get("status") != "ok":
+            return {
+                "status": "pausado_por_erro",
+                "message": "Processamento interrompido. O cursor não deve avançar no passo com erro.",
+                "passos_executados": len(resultados),
+                "ultimo_resultado": resultado,
+                "resultados": resultados,
+            }
+
+        if resultado.get("finalizado"):
+            return {
+                "status": "ok",
+                "finalizado": True,
+                "message": "Carga histórica Fev–Ago/2026 concluída.",
+                "passos_executados": len(resultados),
+                "resultados": resultados,
+                "base_vendas_alterada": False,
+            }
+
+        if i < passos - 1:
+            time.sleep(pausa_segundos)
+
+    return {
+        "status": "ok",
+        "finalizado": False,
+        "message": "Lote concluído; cursor salvo para a próxima execução.",
+        "passos_executados": len(resultados),
+        "proximo": resultados[-1].get("proximo") if resultados else None,
+        "resultados": resultados,
+        "base_vendas_alterada": False,
+    }
+
 @app.get("/omie/nfe/diagnostico-local")
 def diagnostico_omie_nf_local(ano: int = 2026):
     """
