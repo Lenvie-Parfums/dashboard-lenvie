@@ -334,6 +334,174 @@ def test_omie_nfe():
 
 
 
+
+@app.get("/omie/nfe/sync-2025-step")
+def sync_2025_step():
+    """
+    Backfill histórico de Jan–Dez/2025, UMA página por execução.
+    Usa cursor separado (OMIE_SYNC_2025_CONTROLE), portanto não altera
+    OMIE_SYNC_CONTROLE de 2026. Faz merge idempotente em OMIE_NF e não
+    altera BASE_VENDAS.
+    """
+    import calendar
+
+    try:
+        sheets = get_sheets_client()
+        controle_aba = "OMIE_SYNC_2025_CONTROLE"
+        get_or_create_sheet(sheets, controle_aba)
+
+        headers_ctrl = ["ANO", "MES", "PAGINA", "STATUS", "ATUALIZADO_EM", "ULTIMO_ERRO"]
+        controle = sheets.get(f"{controle_aba}!A1:F10")
+
+        ano, mes, pagina = 2025, 1, 1
+        if controle and len(controle) >= 2:
+            cab = [clean(x) for x in controle[0]]
+            if cab == headers_ctrl:
+                row = controle[1]
+                try:
+                    ano = int(clean(row[0]) or 2025)
+                    mes = int(clean(row[1]) or 1)
+                    pagina = int(clean(row[2]) or 1)
+                except Exception:
+                    ano, mes, pagina = 2025, 1, 1
+
+        if ano > 2025 or mes > 12:
+            return {
+                "status": "ok",
+                "finalizado": True,
+                "message": "Carga histórica Jan–Dez/2025 concluída.",
+                "base_vendas_alterada": False,
+                "controle": controle_aba,
+            }
+
+        omie = get_omie_client()
+        ultimo_dia = calendar.monthrange(ano, mes)[1]
+        data_inicial = f"01/{mes:02d}/{ano}"
+        data_final = f"{ultimo_dia:02d}/{mes:02d}/{ano}"
+
+        resposta = omie.call(
+            endpoint=ENDPOINTS["nfe"],
+            call="ListarNF",
+            param={
+                "pagina": pagina,
+                "registros_por_pagina": 100,
+                "dEmiInicial": data_inicial,
+                "dEmiFinal": data_final,
+            },
+        )
+
+        notas = resposta.get("nfCadastro") or []
+        total_paginas = int(resposta.get("total_de_paginas") or 1)
+        novas_rows = normalize_nfe(notas)
+
+        headers = [
+            "ID_NF","CHAVE_NFE","NUM_NF","SERIE","DATA_EMISSAO","TIPO_NF",
+            "DATA_CANCELAMENTO","ID_PEDIDO","NUM_PEDIDO","COD_CLIENTE","CNPJ_CPF",
+            "CLIENTE_NOME","COD_VENDEDOR","CATEGORIA","ID_ITEM","COD_PRODUTO_OMIE",
+            "SKU","PRODUTO","CFOP","NCM","QUANTIDADE","UNIDADE","VALOR_UNITARIO",
+            "VALOR_PRODUTO","DESCONTO_ITEM","FRETE_ITEM","OUTROS_ITEM",
+            "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
+        ]
+
+        atual = sheets.get("OMIE_NF!A1:AF50000")
+        existentes = []
+        if atual:
+            cab = [clean(x) for x in atual[0]]
+            if cab != headers:
+                return {
+                    "status": "error",
+                    "error": "Cabeçalho da OMIE_NF diferente do contrato. Nada foi alterado.",
+                    "controle": controle_aba,
+                }
+            existentes = atual[1:]
+
+        def row_key(r):
+            id_nf = clean(r[0]) if len(r) > 0 else ""
+            id_item = clean(r[14]) if len(r) > 14 else ""
+            fallback = "|".join([
+                clean(r[16]) if len(r) > 16 else "",
+                clean(r[18]) if len(r) > 18 else "",
+                clean(r[23]) if len(r) > 23 else "",
+                clean(r[20]) if len(r) > 20 else "",
+            ])
+            return f"{id_nf}|{id_item or fallback}"
+
+        merged = {row_key(r): r for r in existentes if r}
+        chaves_antes = set(merged)
+        for r in novas_rows:
+            if r:
+                merged[row_key(r)] = r
+
+        consolidadas = list(merged.values())
+        itens_novos = len(set(merged) - chaves_antes)
+
+        # Só substitui a aba depois de consulta, normalização e merge concluídos.
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'OMIE_NF'!A:AF",
+            body={},
+        ).execute()
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'OMIE_NF'!A1",
+            valueInputOption="RAW",
+            body={"values": [headers] + consolidadas},
+        ).execute()
+
+        if pagina >= total_paginas:
+            prox_mes, prox_pagina = mes + 1, 1
+        else:
+            prox_mes, prox_pagina = mes, pagina + 1
+
+        finalizado = prox_mes > 12
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        ctrl_row = [
+            2026 if finalizado else 2025,
+            1 if finalizado else prox_mes,
+            1 if finalizado else prox_pagina,
+            "FINALIZADO" if finalizado else "EM_ANDAMENTO",
+            now,
+            "",
+        ]
+
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id,
+            range=f"'{controle_aba}'!A:F",
+            body={},
+        ).execute()
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,
+            range=f"'{controle_aba}'!A1",
+            valueInputOption="RAW",
+            body={"values": [headers_ctrl, ctrl_row]},
+        ).execute()
+
+        return {
+            "status": "ok",
+            "processado": {"ano": ano, "mes": mes, "pagina": pagina},
+            "total_paginas_mes": total_paginas,
+            "nfs_recebidas": len(notas),
+            "itens_pagina": len(novas_rows),
+            "itens_realmente_novos": itens_novos,
+            "total_itens_omie_nf": len(consolidadas),
+            "proximo": None if finalizado else {
+                "ano": 2025, "mes": prox_mes, "pagina": prox_pagina
+            },
+            "finalizado": finalizado,
+            "base_vendas_alterada": False,
+            "controle": controle_aba,
+            "cursor_2026_alterado": False,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": repr(e),
+            "message": "Cursor 2025 não avançou; a mesma página poderá ser repetida.",
+            "base_vendas_alterada": False,
+        }
+
 @app.get("/omie/nfe/sync-historico-step")
 def sync_historico_step():
     """
