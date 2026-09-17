@@ -488,35 +488,64 @@ def sync_2025_step():
             if r and len(r) > 0 and clean(r[0])
         }
 
-        batch = sheets.api.spreadsheets().values().batchGet(
-            spreadsheetId=sheets.spreadsheet_id,
-            ranges=["'OMIE_NF'!A2:A", "'OMIE_NF'!O2:O"],
-            majorDimension="COLUMNS",
-        ).execute()
-
-        value_ranges = batch.get("valueRanges") or []
-        ids_nf_existentes = (
-            (value_ranges[0].get("values") or [[]])[0]
-            if len(value_ranges) > 0 else []
-        )
-        ids_item_existentes = (
-            (value_ranges[1].get("values") or [[]])[0]
-            if len(value_ranges) > 1 else []
-        )
-
-        total_existente = max(len(ids_nf_existentes), len(ids_item_existentes))
+        # Varredura em blocos para manter o pico de memória baixo no Render (512 MB).
+        # Em vez de carregar A2:A e O2:O inteiras de uma vez, lê 20 mil linhas
+        # por chamada e descarta o bloco após extrair apenas as chaves das NFs
+        # presentes na página atual da Omie.
+        TAMANHO_BLOCO = 20000
+        linha_inicio = 2
+        total_existente = 0
         chaves_antes = set()
 
-        for i, id_nf_raw in enumerate(ids_nf_existentes):
-            id_nf = clean(id_nf_raw)
-            if not id_nf or id_nf not in ids_nf_pagina:
-                continue
-            id_item = (
-                clean(ids_item_existentes[i])
-                if i < len(ids_item_existentes) else ""
+        while True:
+            linha_fim = linha_inicio + TAMANHO_BLOCO - 1
+
+            batch = sheets.api.spreadsheets().values().batchGet(
+                spreadsheetId=sheets.spreadsheet_id,
+                ranges=[
+                    f"'OMIE_NF'!A{linha_inicio}:A{linha_fim}",
+                    f"'OMIE_NF'!O{linha_inicio}:O{linha_fim}",
+                ],
+                majorDimension="COLUMNS",
+            ).execute()
+
+            value_ranges = batch.get("valueRanges") or []
+            ids_nf_bloco = (
+                (value_ranges[0].get("values") or [[]])[0]
+                if len(value_ranges) > 0 else []
             )
-            if id_item:
-                chaves_antes.add(f"{id_nf}|{id_item}")
+            ids_item_bloco = (
+                (value_ranges[1].get("values") or [[]])[0]
+                if len(value_ranges) > 1 else []
+            )
+
+            qtd_bloco = len(ids_nf_bloco)
+
+            # ID_NF é obrigatório nas linhas normalizadas. Bloco vazio = fim dos dados.
+            if qtd_bloco == 0:
+                break
+
+            total_existente += qtd_bloco
+
+            for i, id_nf_raw in enumerate(ids_nf_bloco):
+                id_nf = clean(id_nf_raw)
+                if not id_nf or id_nf not in ids_nf_pagina:
+                    continue
+
+                id_item = (
+                    clean(ids_item_bloco[i])
+                    if i < len(ids_item_bloco) else ""
+                )
+                if id_item:
+                    chaves_antes.add(f"{id_nf}|{id_item}")
+
+            # Último bloco parcial: não há necessidade de uma chamada extra.
+            if qtd_bloco < TAMANHO_BLOCO:
+                break
+
+            # Libera referências grandes antes da próxima chamada.
+            del batch, value_ranges, ids_nf_bloco, ids_item_bloco
+            linha_inicio += TAMANHO_BLOCO
 
         # Escrita incremental: adiciona SOMENTE chaves ainda inexistentes.
         novas_para_append = []
@@ -585,7 +614,7 @@ def sync_2025_step():
             "controle": controle_aba,
             "cursor_2026_alterado": False,
             "modo_gravacao": "incremental_append",
-            "modo_deduplicacao": "pagina_id_nf_id_item",
+            "modo_deduplicacao": "pagina_em_blocos_20k",
         }
 
     except Exception as e:
