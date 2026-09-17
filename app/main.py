@@ -435,18 +435,30 @@ def sync_2025_step():
         consolidadas = list(merged.values())
         itens_novos = len(set(merged) - chaves_antes)
 
-        # Só substitui a aba depois de consulta, normalização e merge concluídos.
-        sheets.api.spreadsheets().values().clear(
-            spreadsheetId=sheets.spreadsheet_id,
-            range="'OMIE_NF'!A:AF",
-            body={},
-        ).execute()
-        sheets.api.spreadsheets().values().update(
-            spreadsheetId=sheets.spreadsheet_id,
-            range="'OMIE_NF'!A1",
-            valueInputOption="RAW",
-            body={"values": [headers] + consolidadas},
-        ).execute()
+        # Escrita incremental: adiciona SOMENTE chaves ainda inexistentes.
+        # Não limpa nem regrava a OMIE_NF inteira.
+        novas_para_append = []
+        chaves_append = set()
+        for r in novas_rows:
+            if not r:
+                continue
+            k = row_key(r)
+            if k not in chaves_antes and k not in chaves_append:
+                novas_para_append.append(r)
+                chaves_append.add(k)
+
+        if novas_para_append:
+            sheets.api.spreadsheets().values().append(
+                spreadsheetId=sheets.spreadsheet_id,
+                range="'OMIE_NF'!A:AF",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": novas_para_append},
+            ).execute()
+
+        # Total lógico após o append, sem reescrever a base.
+        total_apos_append = len(existentes) + len(novas_para_append)
+        itens_novos = len(novas_para_append)
 
         if pagina >= total_paginas:
             prox_mes, prox_pagina = mes + 1, 1
@@ -484,7 +496,7 @@ def sync_2025_step():
             "nfs_recebidas": len(notas),
             "itens_pagina": len(novas_rows),
             "itens_realmente_novos": itens_novos,
-            "total_itens_omie_nf": len(consolidadas),
+            "total_itens_omie_nf": total_apos_append,
             "proximo": None if finalizado else {
                 "ano": 2025, "mes": prox_mes, "pagina": prox_pagina
             },
@@ -492,6 +504,7 @@ def sync_2025_step():
             "base_vendas_alterada": False,
             "controle": controle_aba,
             "cursor_2026_alterado": False,
+            "modo_gravacao": "incremental_append",
         }
 
     except Exception as e:
