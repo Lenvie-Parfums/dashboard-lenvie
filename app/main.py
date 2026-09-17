@@ -335,6 +335,39 @@ def test_omie_nfe():
 
 
 
+
+@app.post("/omie/nfe/restaurar-cursor-2025-setembro-7")
+def restaurar_cursor_2025_setembro_7():
+    """
+    Recuperação pontual do cursor 2025 para o checkpoint confirmado em log:
+    Setembro/2025, página 7. Não chama Omie e não altera OMIE_NF/BASE_VENDAS.
+    """
+    try:
+        sheets = get_sheets_client()
+        controle_aba = "OMIE_SYNC_2025_CONTROLE"
+        get_or_create_sheet(sheets, controle_aba)
+        headers_ctrl = ["ANO", "MES", "PAGINA", "STATUS", "ATUALIZADO_EM", "ULTIMO_ERRO"]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ctrl_row = [2025, 9, 7, "EM_ANDAMENTO", now, "RECUPERADO_APOS_RESET_DE_CURSOR"]
+
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,
+            range=f"'{controle_aba}'!A1:F2",
+            valueInputOption="RAW",
+            body={"values": [headers_ctrl, ctrl_row]},
+        ).execute()
+
+        return {
+            "status": "ok",
+            "cursor_restaurado": {"ano": 2025, "mes": 9, "pagina": 7},
+            "omie_api_chamada": False,
+            "omie_nf_alterada": False,
+            "base_vendas_alterada": False,
+            "cursor_2026_alterado": False,
+        }
+    except Exception as e:
+        return {"status": "error", "error": repr(e)}
+
 @app.get("/omie/nfe/sync-2025-step")
 def sync_2025_step():
     """
@@ -353,17 +386,40 @@ def sync_2025_step():
         headers_ctrl = ["ANO", "MES", "PAGINA", "STATUS", "ATUALIZADO_EM", "ULTIMO_ERRO"]
         controle = sheets.get(f"{controle_aba}!A1:F10")
 
-        ano, mes, pagina = 2025, 1, 1
-        if controle and len(controle) >= 2:
-            cab = [clean(x) for x in controle[0]]
-            if cab == headers_ctrl:
-                row = controle[1]
-                try:
-                    ano = int(clean(row[0]) or 2025)
-                    mes = int(clean(row[1]) or 1)
-                    pagina = int(clean(row[2]) or 1)
-                except Exception:
-                    ano, mes, pagina = 2025, 1, 1
+        # Segurança: em carga histórica em andamento, cursor ausente/inválido
+        # NÃO pode reiniciar silenciosamente em Jan/2025.
+        if not controle or len(controle) < 2:
+            return {
+                "status": "error",
+                "error": "CURSOR_2025_AUSENTE",
+                "message": "OMIE_SYNC_2025_CONTROLE está ausente/vazio. Nada foi processado.",
+                "base_vendas_alterada": False,
+                "controle": controle_aba,
+            }
+
+        cab = [clean(x) for x in controle[0]]
+        if cab != headers_ctrl:
+            return {
+                "status": "error",
+                "error": "CURSOR_2025_CABECALHO_INVALIDO",
+                "message": "Cabeçalho do controle 2025 inválido. Nada foi processado.",
+                "base_vendas_alterada": False,
+                "controle": controle_aba,
+            }
+
+        row = controle[1]
+        try:
+            ano = int(clean(row[0]))
+            mes = int(clean(row[1]))
+            pagina = int(clean(row[2]))
+        except Exception:
+            return {
+                "status": "error",
+                "error": "CURSOR_2025_INVALIDO",
+                "message": "Cursor 2025 inválido. Nada foi processado.",
+                "base_vendas_alterada": False,
+                "controle": controle_aba,
+            }
 
         if ano > 2025 or mes > 12:
             return {
@@ -403,7 +459,7 @@ def sync_2025_step():
             "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
         ]
 
-        atual = sheets.get("OMIE_NF!A1:AF50000")
+        atual = sheets.get("OMIE_NF!A:AF")
         existentes = []
         if atual:
             cab = [clean(x) for x in atual[0]]
@@ -477,14 +533,11 @@ def sync_2025_step():
             "",
         ]
 
-        sheets.api.spreadsheets().values().clear(
-            spreadsheetId=sheets.spreadsheet_id,
-            range=f"'{controle_aba}'!A:F",
-            body={},
-        ).execute()
+        # Atualiza o cursor diretamente, sem limpar a aba antes.
+        # Assim uma falha entre clear/update não deixa o controle vazio.
         sheets.api.spreadsheets().values().update(
             spreadsheetId=sheets.spreadsheet_id,
-            range=f"'{controle_aba}'!A1",
+            range=f"'{controle_aba}'!A1:F2",
             valueInputOption="RAW",
             body={"values": [headers_ctrl, ctrl_row]},
         ).execute()
