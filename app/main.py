@@ -1580,6 +1580,156 @@ def auditar_fechamento_valores_2025():
             "cursor_2026_alterado": False,
         }
 
+
+# ============================================================
+# VALIDACAO FINAL DA FORMULA LIQUIDA 2025 - SOMENTE LEITURA
+# ============================================================
+
+@app.get("/omie/raw-historico/validar-formula-liquida-2025")
+def validar_formula_liquida_2025():
+    """Valida item a item: VALOR_TOTAL_ITEM - DESCONTO_ITEM + FRETE_ITEM + OUTROS_ITEM."""
+    from datetime import datetime as _dt
+
+    CFOP_VENDA = {
+        "5.101","5.102","5.113","5.401","5.403",
+        "6.101","6.102","6.107","6.108","6.109","6.110",
+        "6.113","6.401","6.403",
+    }
+    CFOP_BONIFICACAO = {"5.910","6.910"}
+    TOL = 0.02
+
+    def parse_data(v):
+        s = clean(v)
+        if not s: return None
+        for f in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%Y %H:%M:%S","%Y-%m-%d %H:%M:%S"):
+            try: return _dt.strptime(s[:19], f)
+            except Exception: pass
+        try: return _dt.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception: return None
+
+    def numero(v):
+        s = clean(v)
+        if not s: return 0.0
+        try:
+            return float(s.replace(".", "").replace(",", ".")) if "," in s else float(s)
+        except Exception: return 0.0
+
+    try:
+        principal = get_sheets_client()
+        raw = get_raw_historico_sheets_client()
+        chaves, nfs, fontes = set(), {}, {}
+
+        def ler_fonte(client, aba, nome):
+            inicio, bloco, linhas_2025, duplicadas = 2, 10000, 0, 0
+            while True:
+                # A ID_NF; C NUM_NF; E DATA; G CANCELAMENTO; O ID_ITEM; S CFOP;
+                # Y DESCONTO_ITEM; Z FRETE_ITEM; AA OUTROS_ITEM; AB VALOR_TOTAL_ITEM; AE VALOR_NF
+                letras = ["A","C","E","G","O","S","Y","Z","AA","AB","AE"]
+                ranges = [f"'{aba}'!{c}{inicio}:{c}{inicio+bloco-1}" for c in letras]
+                resp = client.api.spreadsheets().values().batchGet(
+                    spreadsheetId=client.spreadsheet_id, ranges=ranges, majorDimension="ROWS"
+                ).execute()
+                cols = [(x.get("values") or []) for x in (resp.get("valueRanges") or [])]
+                n = max([len(x) for x in cols] or [0])
+                if n == 0: break
+
+                def cel(c, i):
+                    if c >= len(cols) or i >= len(cols[c]) or not cols[c][i]: return ""
+                    return clean(cols[c][i][0])
+
+                for i in range(n):
+                    id_nf, data_txt = cel(0,i), cel(2,i)
+                    data = parse_data(data_txt)
+                    if not id_nf or not data or data.year != 2025: continue
+                    linhas_2025 += 1
+                    num_nf, cancelamento, id_item, cfop = cel(1,i), cel(3,i), cel(4,i), cel(5,i)
+                    desconto, frete, outros = numero(cel(6,i)), numero(cel(7,i)), numero(cel(8,i))
+                    total_item, valor_nf = numero(cel(9,i)), numero(cel(10,i))
+                    chave = f"{id_nf}|{id_item}" if id_item else f"FALLBACK|{id_nf}|{cfop}|{total_item}|{i+inicio}"
+                    if chave in chaves:
+                        duplicadas += 1; continue
+                    chaves.add(chave)
+                    nf = nfs.setdefault(id_nf, {
+                        "id_nf": id_nf, "num_nf": num_nf, "data_emissao": data_txt, "mes": data.month,
+                        "cancelada": bool(cancelamento), "valor_nf": valor_nf, "itens_venda": 0,
+                        "liquido_total": 0.0, "valor_comercial_liquido": 0.0, "valor_bonificado_liquido": 0.0,
+                        "desconto": 0.0, "frete": 0.0, "outros": 0.0, "cfops": set(),
+                    })
+                    if cancelamento: nf["cancelada"] = True
+                    if not nf["valor_nf"] and valor_nf: nf["valor_nf"] = valor_nf
+                    if cfop: nf["cfops"].add(cfop)
+                    liquido = total_item - desconto + frete + outros
+                    nf["liquido_total"] += liquido
+                    nf["desconto"] += desconto; nf["frete"] += frete; nf["outros"] += outros
+                    if cfop in CFOP_VENDA:
+                        nf["itens_venda"] += 1; nf["valor_comercial_liquido"] += liquido
+                    elif cfop in CFOP_BONIFICACAO:
+                        nf["valor_bonificado_liquido"] += liquido
+
+                if n < bloco: break
+                inicio += bloco
+            fontes[nome] = {"linhas_2025_lidas": linhas_2025, "duplicidades_ignoradas": duplicadas}
+
+        ler_fonte(principal, "OMIE_NF", "RAW_ANTIGA")
+        ler_fonte(raw, "OMIE_NF_2025", "RAW_NOVA")
+
+        iguais = menores = maiores_n = total_nfs = 0
+        soma_nf = soma_liquida = soma_comercial = soma_bonificado = 0.0
+        divergencias = []
+        meses = {m:{"nfs":0,"iguais":0,"divergentes":0,"diferenca_liquida":0.0} for m in range(1,13)}
+
+        for nf in nfs.values():
+            if nf["itens_venda"] <= 0 or nf["cancelada"]: continue
+            total_nfs += 1
+            dif = nf["liquido_total"] - nf["valor_nf"]
+            pm = meses[nf["mes"]]; pm["nfs"] += 1; pm["diferenca_liquida"] += dif
+            if abs(dif) <= TOL:
+                iguais += 1; pm["iguais"] += 1
+            else:
+                pm["divergentes"] += 1
+                if dif < 0: menores += 1
+                else: maiores_n += 1
+                divergencias.append({
+                    "id_nf": nf["id_nf"], "num_nf": nf["num_nf"], "data_emissao": nf["data_emissao"],
+                    "cfops": sorted(nf["cfops"]), "valor_nf": round(nf["valor_nf"],2),
+                    "soma_itens_liquidos": round(nf["liquido_total"],2), "diferenca": round(dif,2),
+                    "valor_comercial_liquido": round(nf["valor_comercial_liquido"],2),
+                    "valor_bonificado_liquido": round(nf["valor_bonificado_liquido"],2),
+                    "desconto_itens": round(nf["desconto"],2), "frete_itens": round(nf["frete"],2),
+                    "outros_itens": round(nf["outros"],2),
+                })
+            soma_nf += nf["valor_nf"]; soma_liquida += nf["liquido_total"]
+            soma_comercial += nf["valor_comercial_liquido"]; soma_bonificado += nf["valor_bonificado_liquido"]
+
+        divergencias.sort(key=lambda x: abs(x["diferenca"]), reverse=True)
+        meses_saida = {f"{m:02d}": {
+            "nfs_comerciais_validas": x["nfs"], "iguais": x["iguais"], "divergentes": x["divergentes"],
+            "diferenca_liquida": round(x["diferenca_liquida"],2)
+        } for m,x in meses.items()}
+
+        return {
+            "status":"ok", "ano":2025, "somente_leitura":True, "omie_api_chamada":False,
+            "planilha_principal_alterada":False, "planilha_raw_alterada":False,
+            "base_vendas_alterada":False, "cursor_2025_alterado":False, "cursor_2026_alterado":False,
+            "formula_testada":"VALOR_TOTAL_ITEM - DESCONTO_ITEM + FRETE_ITEM + OUTROS_ITEM",
+            "tolerancia_igualdade":TOL,
+            "resumo": {
+                "nfs_comerciais_validas":total_nfs, "iguais_ao_valor_nf":iguais,
+                "divergentes":menores+maiores_n, "liquido_menor_que_nf":menores, "liquido_maior_que_nf":maiores_n,
+                "percentual_fechamento":round((iguais/total_nfs*100) if total_nfs else 0,4),
+                "soma_valor_nf":round(soma_nf,2), "soma_itens_liquidos":round(soma_liquida,2),
+                "diferenca_liquida_total":round(soma_liquida-soma_nf,2),
+                "valor_comercial_liquido":round(soma_comercial,2),
+                "valor_bonificado_liquido":round(soma_bonificado,2),
+            },
+            "meses":meses_saida, "maiores_50_divergencias":divergencias[:50], "fontes":fontes,
+            "proximo_passo":"Se o fechamento for praticamente total, usar a formula liquida por item na geracao da BASE_VENDAS."
+        }
+    except Exception as e:
+        return {"status":"error","ano":2025,"somente_leitura":True,"error":repr(e),
+                "omie_api_chamada":False,"planilha_principal_alterada":False,"planilha_raw_alterada":False,
+                "base_vendas_alterada":False,"cursor_2025_alterado":False,"cursor_2026_alterado":False}
+
 # ============================================================
 # AUXILIARES
 # ============================================================
