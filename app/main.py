@@ -488,14 +488,24 @@ def auditoria_historico_2025():
 # ============================================================
 
 @app.get("/omie/raw-historico/previa-nfs-2025")
-def previa_nfs_2025():
+def previa_nfs_2025(mes: int):
     """
-    Consolida logicamente RAW antiga + RAW nova, deduplica ID_NF+ID_ITEM
-    e retorna uma visão por NF para análise dos CFOPs.
-    SOMENTE LEITURA: não altera planilhas, cursores ou BASE_VENDAS.
+    Prévia mensal 2025 - SOMENTE LEITURA.
+    Uso: GET /omie/raw-historico/previa-nfs-2025?mes=1
+
+    Lê RAW antiga + RAW nova em blocos, mas mantém em memória somente
+    as chaves/itens do mês solicitado. Não altera planilhas, cursores
+    ou BASE_VENDAS e não chama a API Omie.
     """
-    from collections import defaultdict, Counter
+    from collections import Counter
     from datetime import datetime as _dt
+
+    if mes < 1 or mes > 12:
+        return {
+            "status": "error",
+            "error": "mes deve estar entre 1 e 12",
+            "somente_leitura": True
+        }
 
     HEADER = [
         "ID_NF","CHAVE_NFE","NUM_NF","SERIE","DATA_EMISSAO","TIPO_NF",
@@ -506,16 +516,29 @@ def previa_nfs_2025():
         "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
     ]
 
+    # Regra provisória para diagnóstico. Nada é gravado.
+    CFOP_VENDA = {
+        "5.101","5.102","5.113","5.401","5.403",
+        "6.101","6.102","6.107","6.108","6.109","6.113",
+        "6.401","6.403","7.101","7.102",
+    }
+    CFOP_EXCLUIDO = {"5.910","6.910"}
+
     def ano_mes(v):
         s = clean(v)
-        for f in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%Y %H:%M:%S","%Y-%m-%d %H:%M:%S"):
+        if not s:
+            return None, None
+        for f in (
+            "%d/%m/%Y", "%Y-%m-%d",
+            "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"
+        ):
             try:
                 d = _dt.strptime(s[:19], f)
                 return d.year, d.month
             except Exception:
                 pass
         try:
-            d = _dt.fromisoformat(s.replace("Z","+00:00"))
+            d = _dt.fromisoformat(s.replace("Z", "+00:00"))
             return d.year, d.month
         except Exception:
             return None, None
@@ -525,84 +548,84 @@ def previa_nfs_2025():
         if not s:
             return 0.0
         try:
-            return float(str(s).replace(".", "").replace(",", ".")) if "," in str(s) else float(s)
+            if "," in s:
+                return float(s.replace(".", "").replace(",", "."))
+            return float(s)
         except Exception:
             return 0.0
-
-    # Classificação inicial propositalmente conservadora.
-    # Só marca como VENDA os CFOPs comerciais já conhecidos/observados.
-    # 5.910/6.910 e demais operações ficam EXCLUIDO/PENDENTE conforme regra.
-    CFOP_VENDA = {
-        "5.101","5.102","5.113","5.401","5.403",
-        "6.101","6.102","6.107","6.108","6.109","6.113",
-        "6.401","6.403",
-        "7.101","7.102",
-    }
-    CFOP_EXCLUIDO = {
-        "5.910","6.910",
-    }
 
     try:
         principal = get_sheets_client()
         raw = get_raw_historico_sheets_client()
 
-        # Guarda apenas uma ocorrência de cada item lógico.
+        # Somente itens do mês solicitado ficam em memória.
         itens = {}
         origem_por_chave = {}
 
-        def carregar(client, aba, origem):
+        def carregar_mes(client, aba, origem):
             cab = client.get(f"'{aba}'!A1:AF1")
             if not cab or [clean(x) for x in cab[0]] != HEADER:
                 raise RuntimeError(f"{origem}: cabecalho A:AF invalido")
 
             inicio = 2
-            bloco = 10000
-            lidas_2025 = 0
-            repetidas = 0
+            bloco = 5000
+            linhas_lidas = 0
+            linhas_mes = 0
+            duplicadas_ignoradas = 0
 
             while True:
                 dados = client.get(f"'{aba}'!A{inicio}:AF{inicio+bloco-1}")
                 if not dados:
                     break
 
+                linhas_lidas += len(dados)
+
                 for r in dados:
                     if not r or not any(clean(x) for x in r):
                         continue
+
                     a, m = ano_mes(r[4] if len(r) > 4 else "")
-                    if a != 2025:
+                    if a != 2025 or m != mes:
                         continue
 
-                    id_nf = clean(r[0]) if len(r) > 0 else ""
-                    id_item = clean(r[14]) if len(r) > 14 else ""
+                    linhas_mes += 1
+                    rr = list(r) + [""] * (32 - len(r))
+                    rr = rr[:32]
+
+                    id_nf = clean(rr[0])
+                    id_item = clean(rr[14])
+
                     if id_item:
                         chave = f"{id_nf}|{id_item}"
                     else:
-                        sku = clean(r[16]) if len(r) > 16 else ""
-                        cfop = clean(r[18]) if len(r) > 18 else ""
-                        qtd = clean(r[20]) if len(r) > 20 else ""
-                        val = clean(r[27]) if len(r) > 27 else ""
+                        sku = clean(rr[16])
+                        cfop = clean(rr[18])
+                        qtd = clean(rr[20])
+                        val = clean(rr[27])
                         chave = f"FALLBACK|{id_nf}|{sku}|{cfop}|{qtd}|{val}"
 
-                    lidas_2025 += 1
                     if chave in itens:
-                        repetidas += 1
+                        duplicadas_ignoradas += 1
                         continue
 
-                    # Completa até 32 posições para acesso seguro.
-                    rr = list(r) + [""] * (32 - len(r))
-                    itens[chave] = rr[:32]
+                    itens[chave] = rr
                     origem_por_chave[chave] = origem
 
                 if len(dados) < bloco:
                     break
                 inicio += bloco
 
-            return {"linhas_2025_lidas": lidas_2025, "duplicadas_ignoradas": repetidas}
+            return {
+                "linhas_fisicas_lidas": linhas_lidas,
+                "linhas_do_mes": linhas_mes,
+                "duplicadas_ignoradas_na_consolidacao": duplicadas_ignoradas,
+            }
 
-        carga_antiga = carregar(principal, "OMIE_NF", "RAW_ANTIGA")
-        carga_nova = carregar(raw, "OMIE_NF_2025", "RAW_NOVA")
+        carga_antiga = carregar_mes(principal, "OMIE_NF", "RAW_ANTIGA")
+        carga_nova = carregar_mes(raw, "OMIE_NF_2025", "RAW_NOVA")
 
         nfs = {}
+
         for chave, r in itens.items():
             id_nf = clean(r[0])
             if not id_nf:
@@ -612,15 +635,11 @@ def previa_nfs_2025():
                 nfs[id_nf] = {
                     "id_nf": id_nf,
                     "num_nf": clean(r[2]),
-                    "serie": clean(r[3]),
                     "data_emissao": clean(r[4]),
                     "tipo_nf": clean(r[5]),
                     "data_cancelamento": clean(r[6]),
-                    "id_pedido": clean(r[7]),
-                    "num_pedido": clean(r[8]),
-                    "cod_cliente": clean(r[9]),
-                    "cnpj_cpf": clean(r[10]),
                     "cliente_nome": clean(r[11]),
+                    "cnpj_cpf": clean(r[10]),
                     "cod_vendedor": clean(r[12]),
                     "categoria": clean(r[13]),
                     "valor_nf": num(r[30]),
@@ -635,18 +654,14 @@ def previa_nfs_2025():
                     "valor_itens_venda": 0.0,
                     "valor_itens_excluidos": 0.0,
                     "valor_itens_pendentes": 0.0,
-                    "skus": set(),
                     "origens": set(),
                 }
 
             nf = nfs[id_nf]
             cfop = clean(r[18])
-            sku = clean(r[16])
             valor_item = num(r[27])
 
             nf["qtd_itens"] += 1
-            if sku:
-                nf["skus"].add(sku)
             nf["origens"].add(origem_por_chave.get(chave, ""))
 
             if cfop:
@@ -666,44 +681,41 @@ def previa_nfs_2025():
                 nf["itens_pendentes"] += 1
                 nf["valor_itens_pendentes"] += valor_item
 
-        por_mes = {f"{m:02d}": {
-            "nfs_total": 0, "nfs_com_venda": 0, "nfs_so_pendente_ou_excluida": 0,
-            "valor_nf_soma": 0.0, "valor_itens_venda": 0.0,
-            "valor_itens_excluidos": 0.0, "valor_itens_pendentes": 0.0
-        } for m in range(1, 13)}
-
         cfops = Counter()
-        cfops_pendentes = Counter()
+        pendentes = Counter()
         combinacoes = Counter()
-        exemplos_pendentes = []
+        exemplos = []
+
+        total_valor_nf = 0.0
+        total_venda = 0.0
+        total_excluido = 0.0
+        total_pendente = 0.0
+        nfs_com_venda = 0
+        nfs_com_pendente = 0
+        nfs_so_excluidas = 0
 
         for nf in nfs.values():
-            a, m = ano_mes(nf["data_emissao"])
-            if a != 2025 or not m:
-                continue
-
-            key_mes = f"{m:02d}"
-            por_mes[key_mes]["nfs_total"] += 1
-            por_mes[key_mes]["valor_nf_soma"] += nf["valor_nf"]
-            por_mes[key_mes]["valor_itens_venda"] += nf["valor_itens_venda"]
-            por_mes[key_mes]["valor_itens_excluidos"] += nf["valor_itens_excluidos"]
-            por_mes[key_mes]["valor_itens_pendentes"] += nf["valor_itens_pendentes"]
+            total_valor_nf += nf["valor_nf"]
+            total_venda += nf["valor_itens_venda"]
+            total_excluido += nf["valor_itens_excluidos"]
+            total_pendente += nf["valor_itens_pendentes"]
 
             if nf["itens_venda"] > 0:
-                por_mes[key_mes]["nfs_com_venda"] += 1
-            else:
-                por_mes[key_mes]["nfs_so_pendente_ou_excluida"] += 1
+                nfs_com_venda += 1
+            if nf["itens_pendentes"] > 0:
+                nfs_com_pendente += 1
+            if nf["itens_venda"] == 0 and nf["itens_pendentes"] == 0:
+                nfs_so_excluidas += 1
 
             for c in nf["cfops"]:
                 cfops[c] += 1
             for c in nf["cfops_pendentes"]:
-                cfops_pendentes[c] += 1
+                pendentes[c] += 1
 
-            combo = ";".join(sorted(nf["cfops"]))
-            combinacoes[combo] += 1
+            combinacoes[";".join(sorted(nf["cfops"]))] += 1
 
-            if nf["cfops_pendentes"] and len(exemplos_pendentes) < 100:
-                exemplos_pendentes.append({
+            if nf["cfops_pendentes"] and len(exemplos) < 50:
+                exemplos.append({
                     "id_nf": nf["id_nf"],
                     "num_nf": nf["num_nf"],
                     "data_emissao": nf["data_emissao"],
@@ -713,17 +725,17 @@ def previa_nfs_2025():
                     "cfops_venda": sorted(nf["cfops_venda"]),
                     "cfops_excluidos": sorted(nf["cfops_excluidos"]),
                     "cfops_pendentes": sorted(nf["cfops_pendentes"]),
+                    "qtd_itens": nf["qtd_itens"],
                     "itens_venda": nf["itens_venda"],
                     "itens_excluidos": nf["itens_excluidos"],
                     "itens_pendentes": nf["itens_pendentes"],
+                    "origens": sorted(x for x in nf["origens"] if x),
                 })
-
-        for x in por_mes.values():
-            for k in ("valor_nf_soma","valor_itens_venda","valor_itens_excluidos","valor_itens_pendentes"):
-                x[k] = round(x[k], 2)
 
         return {
             "status": "ok",
+            "ano": 2025,
+            "mes": mes,
             "somente_leitura": True,
             "omie_api_chamada": False,
             "planilha_principal_alterada": False,
@@ -734,28 +746,43 @@ def previa_nfs_2025():
             "carga": {
                 "raw_antiga": carga_antiga,
                 "raw_nova": carga_nova,
-                "itens_unicos_consolidados": len(itens),
-                "nfs_unicas_consolidadas": len(nfs),
+                "itens_unicos_consolidados_mes": len(itens),
+                "nfs_unicas_consolidadas_mes": len(nfs),
+            },
+            "resumo": {
+                "nfs_total": len(nfs),
+                "nfs_com_cfop_venda": nfs_com_venda,
+                "nfs_com_cfop_pendente": nfs_com_pendente,
+                "nfs_somente_excluidas": nfs_so_excluidas,
+                "soma_valor_nf": round(total_valor_nf, 2),
+                "soma_valor_itens_venda": round(total_venda, 2),
+                "soma_valor_itens_excluidos": round(total_excluido, 2),
+                "soma_valor_itens_pendentes": round(total_pendente, 2),
             },
             "regra_previa": {
                 "cfops_venda": sorted(CFOP_VENDA),
                 "cfops_excluidos": sorted(CFOP_EXCLUIDO),
                 "demais_cfops": "PENDENTE",
-                "observacao": "Classificacao provisoria para diagnostico; ainda nao grava BASE_VENDAS."
+                "observacao": "Regra provisoria somente para diagnostico."
             },
-            "por_mes": por_mes,
             "cfops_por_quantidade_de_nfs": dict(sorted(cfops.items())),
-            "cfops_pendentes_por_quantidade_de_nfs": dict(sorted(cfops_pendentes.items())),
+            "cfops_pendentes_por_quantidade_de_nfs": dict(sorted(pendentes.items())),
             "combinacoes_cfop_mais_frequentes": [
-                {"cfops": k, "nfs": v} for k, v in combinacoes.most_common(50)
+                {"cfops": k, "nfs": v}
+                for k, v in combinacoes.most_common(30)
             ],
-            "exemplos_nfs_com_cfop_pendente": exemplos_pendentes,
-            "proximo_passo": "Validar CFOPs pendentes antes de gerar BASE_VENDAS 2025."
+            "exemplos_nfs_com_cfop_pendente": exemplos,
+            "proximo_passo": (
+                "Executar os demais meses de 2025 e validar os CFOPs pendentes "
+                "antes de gerar BASE_VENDAS."
+            ),
         }
 
     except Exception as e:
         return {
             "status": "error",
+            "ano": 2025,
+            "mes": mes,
             "somente_leitura": True,
             "error": repr(e),
             "omie_api_chamada": False,
@@ -765,6 +792,8 @@ def previa_nfs_2025():
             "cursor_2025_alterado": False,
             "cursor_2026_alterado": False,
         }
+
+
 
 
 # ============================================================
