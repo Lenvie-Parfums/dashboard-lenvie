@@ -516,14 +516,13 @@ def previa_nfs_2025(mes: int):
         "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
     ]
 
-    # Regra comercial consolidada. Nada é gravado nesta rota.
+    # Regra provisória para diagnóstico. Nada é gravado.
     CFOP_VENDA = {
         "5.101","5.102","5.113","5.401","5.403",
-        "6.101","6.102","6.107","6.108","6.109","6.110","6.113",
-        "6.401","6.403",
+        "6.101","6.102","6.107","6.108","6.109","6.113",
+        "6.401","6.403","7.101","7.102",
     }
-    CFOP_BONIFICACAO = {"5.910","6.910"}
-    CFOP_A_VALIDAR = {"7.101","7.102"}
+    CFOP_EXCLUIDO = {"5.910","6.910"}
 
     def ano_mes(v):
         s = clean(v)
@@ -704,7 +703,7 @@ def previa_nfs_2025(mes: int):
                 nf["cfops_venda"].add(cfop)
                 nf["itens_venda"] += 1
                 nf["valor_itens_venda"] += valor_item
-            elif cfop in CFOP_BONIFICACAO:
+            elif cfop in CFOP_EXCLUIDO:
                 nf["cfops_excluidos"].add(cfop)
                 nf["itens_excluidos"] += 1
                 nf["valor_itens_excluidos"] += valor_item
@@ -794,10 +793,9 @@ def previa_nfs_2025(mes: int):
             },
             "regra_previa": {
                 "cfops_venda": sorted(CFOP_VENDA),
-                "cfops_bonificacao": sorted(CFOP_BONIFICACAO),
-                "cfops_a_validar": sorted(CFOP_A_VALIDAR),
+                "cfops_excluidos": sorted(CFOP_EXCLUIDO),
                 "demais_cfops": "PENDENTE",
-                "observacao": "Regra comercial consolidada; 7.101 e 7.102 permanecem A_VALIDAR."
+                "observacao": "Regra provisoria somente para diagnostico."
             },
             "cfops_por_quantidade_de_nfs": dict(sorted(cfops.items())),
             "cfops_pendentes_por_quantidade_de_nfs": dict(sorted(pendentes.items())),
@@ -830,86 +828,149 @@ def previa_nfs_2025(mes: int):
 
 
 
+
 # ============================================================
-# CFOPS 2025 - DIAGNOSTICO COMPACTO SOMENTE LEITURA
+# AUDITORIA CFOP PENDENTE X VENDA 2025 - SOMENTE LEITURA
 # ============================================================
 
-@app.get("/omie/raw-historico/cfops-2025-compacto")
-def cfops_2025_compacto():
+@app.get("/omie/raw-historico/pendentes-com-venda-2025")
+def pendentes_com_venda_2025():
     """
-    Levanta os CFOPs existentes em 2025 lendo somente DATA_EMISSAO (E)
-    e CFOP (S) das RAW antiga e nova. Não chama Omie, não grava planilhas,
-    não altera BASE_VENDAS e não altera cursores.
-
-    IMPORTANTE: as quantidades retornadas são ocorrências físicas nas RAWs;
-    servem para descobrir/classificar CFOPs, não para calcular faturamento.
+    Analisa 2025 em RAW antiga + nova e mostra quais CFOPs PENDENTES/A_VALIDAR
+    aparecem em NFs que também possuem CFOP de VENDA.
+    Somente leitura: não chama Omie, não grava planilhas, BASE_VENDAS ou cursores.
     """
-    from collections import Counter
+    from collections import Counter, defaultdict
     from datetime import datetime as _dt
 
     CFOP_VENDA = {
         "5.101","5.102","5.113","5.401","5.403",
-        "6.101","6.102","6.107","6.108","6.109","6.110","6.113",
-        "6.401","6.403",
+        "6.101","6.102","6.107","6.108","6.109","6.110",
+        "6.113","6.401","6.403",
     }
     CFOP_BONIFICACAO = {"5.910","6.910"}
     CFOP_A_VALIDAR = {"7.101","7.102"}
 
-    def eh_2025(v):
-        s = clean(v)
-        if not s:
+    def ano_2025(v):
+        x = clean(v)
+        if not x:
             return False
-        for f in ("%d/%m/%Y", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        for f in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%Y %H:%M:%S","%Y-%m-%d %H:%M:%S"):
             try:
-                return _dt.strptime(s[:19], f).year == 2025
+                return _dt.strptime(x[:19], f).year == 2025
             except Exception:
                 pass
         try:
-            return _dt.fromisoformat(s.replace("Z", "+00:00")).year == 2025
+            return _dt.fromisoformat(x.replace("Z", "+00:00")).year == 2025
         except Exception:
             return False
 
-    def ler_duas_colunas(client, aba, origem):
-        # Uma única chamada batchGet por fonte: E=DATA_EMISSAO, S=CFOP.
-        resp = client.api.spreadsheets().values().batchGet(
-            spreadsheetId=client.spreadsheet_id,
-            ranges=[f"'{aba}'!E2:E", f"'{aba}'!S2:S"],
-            majorDimension="COLUMNS",
-        ).execute()
-        vr = resp.get("valueRanges") or []
-        datas = ((vr[0].get("values") or [[]])[0] if len(vr) > 0 else [])
-        cfops = ((vr[1].get("values") or [[]])[0] if len(vr) > 1 else [])
-        cont = Counter()
-        linhas_2025 = 0
-        for i, data in enumerate(datas):
-            if not eh_2025(data):
-                continue
-            linhas_2025 += 1
-            cfop = clean(cfops[i]) if i < len(cfops) else ""
-            if cfop:
-                cont[cfop] += 1
-        return origem, linhas_2025, cont
+    def classificar(cfop):
+        if cfop in CFOP_VENDA:
+            return "VENDA"
+        if cfop in CFOP_BONIFICACAO:
+            return "BONIFICACAO"
+        if cfop in CFOP_A_VALIDAR:
+            return "A_VALIDAR"
+        return "PENDENTE"
 
     try:
-        fontes = [
-            ler_duas_colunas(get_sheets_client(), "OMIE_NF", "RAW_ANTIGA"),
-            ler_duas_colunas(get_raw_historico_sheets_client(), "OMIE_NF_2025", "RAW_NOVA"),
-        ]
+        principal = get_sheets_client()
+        raw = get_raw_historico_sheets_client()
 
-        total = Counter()
-        detalhe_fontes = {}
-        for origem, linhas, cont in fontes:
-            total.update(cont)
-            detalhe_fontes[origem] = {
-                "linhas_fisicas_2025": linhas,
-                "cfops": dict(sorted(cont.items())),
+        # Mantemos somente sets de CFOP por NF. Não carregamos A:AF nem valores/RAW_JSON.
+        cfops_por_nf = defaultdict(set)
+        chaves_itens = set()
+        fontes = {}
+
+        def ler_fonte(client, aba, nome):
+            # A=ID_NF, E=DATA_EMISSAO, O=ID_ITEM, S=CFOP
+            inicio = 2
+            bloco = 20000
+            linhas_2025 = 0
+            duplicadas_ignoradas = 0
+            while True:
+                resp = client.api.spreadsheets().values().batchGet(
+                    spreadsheetId=client.spreadsheet_id,
+                    ranges=[
+                        f"'{aba}'!A{inicio}:A{inicio+bloco-1}",
+                        f"'{aba}'!E{inicio}:E{inicio+bloco-1}",
+                        f"'{aba}'!O{inicio}:O{inicio+bloco-1}",
+                        f"'{aba}'!S{inicio}:S{inicio+bloco-1}",
+                    ],
+                    majorDimension="ROWS",
+                ).execute()
+                vr = resp.get("valueRanges") or []
+                cols = [(x.get("values") or []) for x in vr]
+                tamanhos = [len(x) for x in cols]
+                n = max(tamanhos or [0])
+                if n == 0:
+                    break
+
+                for i in range(n):
+                    def cel(c):
+                        if c >= len(cols) or i >= len(cols[c]) or not cols[c][i]:
+                            return ""
+                        return clean(cols[c][i][0])
+                    id_nf, data, id_item, cfop = cel(0), cel(1), cel(2), cel(3)
+                    if not id_nf or not ano_2025(data):
+                        continue
+                    linhas_2025 += 1
+                    # Deduplica entre RAW antiga/nova quando ID_ITEM existe.
+                    if id_item:
+                        chave = f"{id_nf}|{id_item}"
+                        if chave in chaves_itens:
+                            duplicadas_ignoradas += 1
+                            continue
+                        chaves_itens.add(chave)
+                    if cfop:
+                        cfops_por_nf[id_nf].add(cfop)
+
+                if n < bloco:
+                    break
+                inicio += bloco
+
+            fontes[nome] = {
+                "linhas_2025_lidas": linhas_2025,
+                "duplicidades_id_nf_id_item_ignoradas": duplicadas_ignoradas,
             }
 
-        encontrados = sorted(total)
-        venda = sorted(c for c in encontrados if c in CFOP_VENDA)
-        bonificacao = sorted(c for c in encontrados if c in CFOP_BONIFICACAO)
-        a_validar = sorted(c for c in encontrados if c in CFOP_A_VALIDAR)
-        pendentes = sorted(c for c in encontrados if c not in CFOP_VENDA | CFOP_BONIFICACAO | CFOP_A_VALIDAR)
+        ler_fonte(principal, "OMIE_NF", "RAW_ANTIGA")
+        ler_fonte(raw, "OMIE_NF_2025", "RAW_NOVA")
+
+        pendentes_em_nf_com_venda = Counter()
+        validar_em_nf_com_venda = Counter()
+        combinacoes = Counter()
+        exemplos = []
+        nfs_com_venda = 0
+        nfs_venda_com_pendente = 0
+        nfs_venda_com_a_validar = 0
+
+        for id_nf, cfops in cfops_por_nf.items():
+            vendas = sorted(c for c in cfops if classificar(c) == "VENDA")
+            if not vendas:
+                continue
+            nfs_com_venda += 1
+            pend = sorted(c for c in cfops if classificar(c) == "PENDENTE")
+            aval = sorted(c for c in cfops if classificar(c) == "A_VALIDAR")
+            if pend:
+                nfs_venda_com_pendente += 1
+                for c in pend:
+                    pendentes_em_nf_com_venda[c] += 1
+            if aval:
+                nfs_venda_com_a_validar += 1
+                for c in aval:
+                    validar_em_nf_com_venda[c] += 1
+            if pend or aval:
+                combinacoes[";".join(sorted(cfops))] += 1
+                if len(exemplos) < 50:
+                    exemplos.append({
+                        "id_nf": id_nf,
+                        "cfops_venda": vendas,
+                        "cfops_pendentes": pend,
+                        "cfops_a_validar": aval,
+                        "cfops_todos": sorted(cfops),
+                    })
 
         return {
             "status": "ok",
@@ -921,23 +982,28 @@ def cfops_2025_compacto():
             "base_vendas_alterada": False,
             "cursor_2025_alterado": False,
             "cursor_2026_alterado": False,
-            "observacao_contagens": "Contagens fisicas nas RAWs; podem conter duplicidades e nao representam NFs unicas nem faturamento.",
-            "regra": {
-                "venda": sorted(CFOP_VENDA),
-                "bonificacao": sorted(CFOP_BONIFICACAO),
-                "a_validar": sorted(CFOP_A_VALIDAR),
-                "demais": "PENDENTE",
+            "criterio": "CFOPs PENDENTE/A_VALIDAR que coexistem na mesma NF com ao menos um CFOP_VENDA",
+            "deduplicacao": "ID_NF + ID_ITEM quando ID_ITEM existe; análise final por conjunto de CFOPs da NF",
+            "resumo": {
+                "nfs_2025_com_cfop": len(cfops_por_nf),
+                "nfs_com_venda": nfs_com_venda,
+                "nfs_venda_com_algum_pendente": nfs_venda_com_pendente,
+                "nfs_venda_com_algum_a_validar": nfs_venda_com_a_validar,
+                "cfops_pendentes_relevantes": len(pendentes_em_nf_com_venda),
+                "cfops_a_validar_relevantes": len(validar_em_nf_com_venda),
             },
-            "resultado": {
-                "cfops_distintos_encontrados": len(encontrados),
-                "cfops_venda_encontrados": venda,
-                "cfops_bonificacao_encontrados": bonificacao,
-                "cfops_a_validar_encontrados": a_validar,
-                "cfops_pendentes": pendentes,
-                "ocorrencias_fisicas_por_cfop": dict(sorted(total.items())),
-            },
-            "fontes": detalhe_fontes,
-            "proximo_passo": "Validar somente os CFOPs pendentes/a_validar antes de gerar BASE_VENDAS.",
+            "cfops_pendentes_em_nfs_com_venda": dict(sorted(
+                pendentes_em_nf_com_venda.items(), key=lambda x: (-x[1], x[0])
+            )),
+            "cfops_a_validar_em_nfs_com_venda": dict(sorted(
+                validar_em_nf_com_venda.items(), key=lambda x: (-x[1], x[0])
+            )),
+            "combinacoes_mais_frequentes": [
+                {"cfops": k, "nfs": v} for k, v in combinacoes.most_common(40)
+            ],
+            "exemplos": exemplos,
+            "fontes": fontes,
+            "proximo_passo": "Validar somente os CFOPs listados como relevantes antes de gerar BASE_VENDAS.",
         }
     except Exception as e:
         return {
@@ -952,7 +1018,6 @@ def cfops_2025_compacto():
             "cursor_2025_alterado": False,
             "cursor_2026_alterado": False,
         }
-
 
 # ============================================================
 # AUXILIARES
