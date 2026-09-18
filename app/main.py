@@ -120,6 +120,126 @@ def teste_conexao_raw_historico():
 
 
 # ============================================================
+# NOVA PLANILHA RAW HISTORICO - PREPARAR ESTRUTURA
+# ============================================================
+
+@app.post("/omie/raw-historico/preparar-estrutura")
+def preparar_estrutura_raw_historico():
+    """
+    Cria/valida somente a aba OMIE_NF_2025 na NOVA planilha RAW.
+    Não chama Omie, não lê/grava a planilha principal e não altera cursores.
+    """
+    try:
+        sheets = get_raw_historico_sheets_client()
+        aba = "OMIE_NF_2025"
+
+        headers = [
+            "ID_NF","CHAVE_NFE","NUM_NF","SERIE","DATA_EMISSAO","TIPO_NF",
+            "DATA_CANCELAMENTO","ID_PEDIDO","NUM_PEDIDO","COD_CLIENTE","CNPJ_CPF",
+            "CLIENTE_NOME","COD_VENDEDOR","CATEGORIA","ID_ITEM","COD_PRODUTO_OMIE",
+            "SKU","PRODUTO","CFOP","NCM","QUANTIDADE","UNIDADE","VALOR_UNITARIO",
+            "VALOR_PRODUTO","DESCONTO_ITEM","FRETE_ITEM","OUTROS_ITEM",
+            "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
+        ]
+
+        metadata = (
+            sheets.api.spreadsheets()
+            .get(
+                spreadsheetId=sheets.spreadsheet_id,
+                fields="sheets.properties.title",
+            )
+            .execute()
+        )
+        existentes = {
+            item.get("properties", {}).get("title", "")
+            for item in metadata.get("sheets", [])
+        }
+
+        aba_criada = False
+        if aba not in existentes:
+            sheets.api.spreadsheets().batchUpdate(
+                spreadsheetId=sheets.spreadsheet_id,
+                body={
+                    "requests": [{
+                        "addSheet": {
+                            "properties": {
+                                "title": aba,
+                                "rowCount": 1000,
+                                "columnCount": 32,
+                            }
+                        }
+                    }]
+                },
+            ).execute()
+            aba_criada = True
+
+        atual = sheets.get(f"'{aba}'!A1:AF1")
+
+        if atual and any(clean(x) for x in atual[0]):
+            cab_atual = [clean(x) for x in atual[0]]
+            if cab_atual != headers:
+                return {
+                    "status": "error",
+                    "error": "CABECALHO_RAW_DIFERENTE_DO_CONTRATO",
+                    "aba": aba,
+                    "aba_criada": aba_criada,
+                    "cabecalho_atual": cab_atual,
+                    "cabecalho_esperado": headers,
+                    "omie_api_chamada": False,
+                    "base_vendas_alterada": False,
+                    "cursor_2025_alterado": False,
+                    "cursor_2026_alterado": False,
+                }
+        else:
+            sheets.api.spreadsheets().values().update(
+                spreadsheetId=sheets.spreadsheet_id,
+                range=f"'{aba}'!A1:AF1",
+                valueInputOption="RAW",
+                body={"values": [headers]},
+            ).execute()
+
+        conferido = sheets.get(f"'{aba}'!A1:AF1")
+        cab_final = [clean(x) for x in (conferido[0] if conferido else [])]
+
+        if cab_final != headers:
+            return {
+                "status": "error",
+                "error": "FALHA_VALIDACAO_CABECALHO_RAW",
+                "aba": aba,
+                "omie_api_chamada": False,
+                "base_vendas_alterada": False,
+                "cursor_2025_alterado": False,
+                "cursor_2026_alterado": False,
+            }
+
+        return {
+            "status": "ok",
+            "message": "Estrutura RAW 2025 preparada e cabeçalho validado.",
+            "spreadsheet_id": sheets.spreadsheet_id,
+            "aba": aba,
+            "aba_criada": aba_criada,
+            "colunas": len(headers),
+            "omie_api_chamada": False,
+            "planilha_principal_alterada": False,
+            "base_vendas_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+            "proximo_passo": "Testar uma unica pagina do cursor 2025 na nova RAW.",
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": repr(e),
+            "omie_api_chamada": False,
+            "planilha_principal_alterada": False,
+            "base_vendas_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+        }
+
+
+# ============================================================
 # AUXILIARES
 # ============================================================
 
@@ -2252,5 +2372,4 @@ def dashboard_frontend():
         }
 
     return FileResponse(index_path, media_type="text/html")
-
 
