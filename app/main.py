@@ -1312,6 +1312,274 @@ def previa_base_vendas_2025():
             "cursor_2026_alterado": False,
         }
 
+
+# ============================================================
+# AUDITORIA DE FECHAMENTO DE VALORES 2025 - SOMENTE LEITURA
+# ============================================================
+
+@app.get("/omie/raw-historico/auditar-fechamento-valores-2025")
+def auditar_fechamento_valores_2025():
+    """
+    Audita NFs comerciais validas de 2025 para entender por que a soma dos itens
+    classificados como VENDA/BONIFICACAO pode diferir do VALOR_NF fiscal.
+    SOMENTE LEITURA: nao chama Omie, nao grava planilhas e nao altera cursores.
+    """
+    from datetime import datetime as _dt
+
+    CFOP_VENDA = {
+        "5.101","5.102","5.113","5.401","5.403",
+        "6.101","6.102","6.107","6.108","6.109","6.110",
+        "6.113","6.401","6.403",
+    }
+    CFOP_BONIFICACAO = {"5.910","6.910"}
+    TOL = 0.02
+
+    def parse_data(v):
+        s = clean(v)
+        if not s:
+            return None
+        for f in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%Y %H:%M:%S","%Y-%m-%d %H:%M:%S"):
+            try:
+                return _dt.strptime(s[:19], f)
+            except Exception:
+                pass
+        try:
+            return _dt.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def numero(v):
+        s = clean(v)
+        if not s:
+            return 0.0
+        try:
+            if "," in s:
+                return float(s.replace(".", "").replace(",", "."))
+            return float(s)
+        except Exception:
+            return 0.0
+
+    try:
+        principal = get_sheets_client()
+        raw = get_raw_historico_sheets_client()
+        chaves = set()
+        nfs = {}
+        fontes = {}
+
+        def ler_fonte(client, aba, nome):
+            inicio = 2
+            bloco = 10000
+            linhas_2025 = 0
+            duplicadas = 0
+            while True:
+                # A ID_NF; C NUM_NF; E DATA_EMISSAO; G DATA_CANCELAMENTO;
+                # O ID_ITEM; S CFOP; X VALOR_PRODUTO; Y DESCONTO_ITEM;
+                # Z FRETE_ITEM; AA OUTROS_ITEM; AB VALOR_TOTAL_ITEM;
+                # AC VALOR_PRODUTOS_NF; AD DESCONTO_NF; AE VALOR_NF.
+                letras = ["A","C","E","G","O","S","X","Y","Z","AA","AB","AC","AD","AE"]
+                ranges = [f"'{aba}'!{c}{inicio}:{c}{inicio+bloco-1}" for c in letras]
+                resp = client.api.spreadsheets().values().batchGet(
+                    spreadsheetId=client.spreadsheet_id,
+                    ranges=ranges,
+                    majorDimension="ROWS",
+                ).execute()
+                vr = resp.get("valueRanges") or []
+                cols = [(x.get("values") or []) for x in vr]
+                n = max([len(x) for x in cols] or [0])
+                if n == 0:
+                    break
+
+                def cel(c, i):
+                    if c >= len(cols) or i >= len(cols[c]) or not cols[c][i]:
+                        return ""
+                    return clean(cols[c][i][0])
+
+                for i in range(n):
+                    id_nf = cel(0, i)
+                    data_txt = cel(2, i)
+                    data = parse_data(data_txt)
+                    if not id_nf or not data or data.year != 2025:
+                        continue
+                    linhas_2025 += 1
+
+                    num_nf = cel(1, i)
+                    cancelamento = cel(3, i)
+                    id_item = cel(4, i)
+                    cfop = cel(5, i)
+                    valor_produto = numero(cel(6, i))
+                    desconto_item = numero(cel(7, i))
+                    frete_item = numero(cel(8, i))
+                    outros_item = numero(cel(9, i))
+                    valor_total_item = numero(cel(10, i))
+                    valor_produtos_nf = numero(cel(11, i))
+                    desconto_nf = numero(cel(12, i))
+                    valor_nf = numero(cel(13, i))
+
+                    chave = f"{id_nf}|{id_item}" if id_item else f"FALLBACK|{id_nf}|{cfop}|{valor_total_item}|{i+inicio}"
+                    if chave in chaves:
+                        duplicadas += 1
+                        continue
+                    chaves.add(chave)
+
+                    nf = nfs.get(id_nf)
+                    if nf is None:
+                        nf = {
+                            "id_nf": id_nf, "num_nf": num_nf, "data_emissao": data_txt,
+                            "mes": data.month, "cancelada": bool(cancelamento),
+                            "valor_nf": valor_nf, "valor_produtos_nf": valor_produtos_nf,
+                            "desconto_nf": desconto_nf,
+                            "qtd_itens": 0, "itens_venda": 0, "itens_bonificados": 0,
+                            "soma_valor_produto": 0.0, "soma_desconto_item": 0.0,
+                            "soma_frete_item": 0.0, "soma_outros_item": 0.0,
+                            "soma_total_item": 0.0, "valor_comercial": 0.0,
+                            "valor_bonificado": 0.0, "cfops": set(),
+                        }
+                        nfs[id_nf] = nf
+                    else:
+                        if cancelamento: nf["cancelada"] = True
+                        if not nf["num_nf"] and num_nf: nf["num_nf"] = num_nf
+                        if not nf["valor_nf"] and valor_nf: nf["valor_nf"] = valor_nf
+                        if not nf["valor_produtos_nf"] and valor_produtos_nf: nf["valor_produtos_nf"] = valor_produtos_nf
+                        if not nf["desconto_nf"] and desconto_nf: nf["desconto_nf"] = desconto_nf
+
+                    nf["qtd_itens"] += 1
+                    if cfop: nf["cfops"].add(cfop)
+                    nf["soma_valor_produto"] += valor_produto
+                    nf["soma_desconto_item"] += desconto_item
+                    nf["soma_frete_item"] += frete_item
+                    nf["soma_outros_item"] += outros_item
+                    nf["soma_total_item"] += valor_total_item
+                    if cfop in CFOP_VENDA:
+                        nf["itens_venda"] += 1
+                        nf["valor_comercial"] += valor_total_item
+                    elif cfop in CFOP_BONIFICACAO:
+                        nf["itens_bonificados"] += 1
+                        nf["valor_bonificado"] += valor_total_item
+
+                if n < bloco:
+                    break
+                inicio += bloco
+
+            fontes[nome] = {"linhas_2025_lidas": linhas_2025, "duplicidades_ignoradas": duplicadas}
+
+        ler_fonte(principal, "OMIE_NF", "RAW_ANTIGA")
+        ler_fonte(raw, "OMIE_NF_2025", "RAW_NOVA")
+
+        contagem = {"igual": 0, "itens_menor_que_nf": 0, "itens_maior_que_nf": 0}
+        por_mes = {m: {"nfs": 0, "igual": 0, "menor": 0, "maior": 0, "diferenca_liquida": 0.0, "diferenca_absoluta": 0.0} for m in range(1,13)}
+        maiores = []
+        total_nfs = 0
+        soma_nf = soma_itens = soma_comercial = soma_bonificado = 0.0
+        soma_produto = soma_desc_item = soma_frete = soma_outros = soma_desc_nf = 0.0
+
+        for nf in nfs.values():
+            if nf["itens_venda"] <= 0 or nf["cancelada"]:
+                continue
+            total_nfs += 1
+            itens_classificados = nf["valor_comercial"] + nf["valor_bonificado"]
+            diferenca = itens_classificados - nf["valor_nf"]
+            abs_dif = abs(diferenca)
+            if abs_dif <= TOL:
+                classe = "IGUAL"
+                contagem["igual"] += 1
+                por_mes[nf["mes"]]["igual"] += 1
+            elif diferenca < 0:
+                classe = "ITENS_MENOR_QUE_NF"
+                contagem["itens_menor_que_nf"] += 1
+                por_mes[nf["mes"]]["menor"] += 1
+            else:
+                classe = "ITENS_MAIOR_QUE_NF"
+                contagem["itens_maior_que_nf"] += 1
+                por_mes[nf["mes"]]["maior"] += 1
+
+            pm = por_mes[nf["mes"]]
+            pm["nfs"] += 1
+            pm["diferenca_liquida"] += diferenca
+            pm["diferenca_absoluta"] += abs_dif
+
+            soma_nf += nf["valor_nf"]
+            soma_itens += itens_classificados
+            soma_comercial += nf["valor_comercial"]
+            soma_bonificado += nf["valor_bonificado"]
+            soma_produto += nf["soma_valor_produto"]
+            soma_desc_item += nf["soma_desconto_item"]
+            soma_frete += nf["soma_frete_item"]
+            soma_outros += nf["soma_outros_item"]
+            soma_desc_nf += nf["desconto_nf"]
+
+            if abs_dif > TOL:
+                maiores.append({
+                    "id_nf": nf["id_nf"], "num_nf": nf["num_nf"],
+                    "data_emissao": nf["data_emissao"], "mes": nf["mes"],
+                    "classificacao": classe, "cfops": sorted(nf["cfops"]),
+                    "valor_nf": round(nf["valor_nf"],2),
+                    "valor_comercial": round(nf["valor_comercial"],2),
+                    "valor_bonificado": round(nf["valor_bonificado"],2),
+                    "comercial_mais_bonificado": round(itens_classificados,2),
+                    "diferenca_itens_menos_nf": round(diferenca,2),
+                    "valor_produtos_nf": round(nf["valor_produtos_nf"],2),
+                    "desconto_nf": round(nf["desconto_nf"],2),
+                    "soma_valor_produto_itens": round(nf["soma_valor_produto"],2),
+                    "soma_desconto_item": round(nf["soma_desconto_item"],2),
+                    "soma_frete_item": round(nf["soma_frete_item"],2),
+                    "soma_outros_item": round(nf["soma_outros_item"],2),
+                    "soma_valor_total_item": round(nf["soma_total_item"],2),
+                    "qtd_itens": nf["qtd_itens"], "itens_venda": nf["itens_venda"],
+                    "itens_bonificados": nf["itens_bonificados"],
+                })
+
+        maiores.sort(key=lambda x: abs(x["diferenca_itens_menos_nf"]), reverse=True)
+        meses_saida = {}
+        for m in range(1,13):
+            x = por_mes[m]
+            meses_saida[f"{m:02d}"] = {
+                "nfs_comerciais_validas": x["nfs"], "iguais": x["igual"],
+                "itens_menor_que_nf": x["menor"], "itens_maior_que_nf": x["maior"],
+                "diferenca_liquida": round(x["diferenca_liquida"],2),
+                "diferenca_absoluta": round(x["diferenca_absoluta"],2),
+            }
+
+        return {
+            "status": "ok", "ano": 2025, "somente_leitura": True,
+            "omie_api_chamada": False, "planilha_principal_alterada": False,
+            "planilha_raw_alterada": False, "base_vendas_alterada": False,
+            "cursor_2025_alterado": False, "cursor_2026_alterado": False,
+            "criterio": {
+                "nfs_analisadas": "somente NFs 2025 com CFOP_VENDA e nao canceladas",
+                "comparacao": "VALOR_COMERCIAL + VALOR_BONIFICADO versus VALOR_NF",
+                "tolerancia_igualdade": TOL,
+                "observacao": "VALOR_COMERCIAL ainda e a soma de VALOR_TOTAL_ITEM dos CFOPs de venda; esta rota apenas audita, nao redefine faturamento.",
+            },
+            "resumo": {
+                "nfs_comerciais_validas": total_nfs,
+                "iguais": contagem["igual"],
+                "itens_menor_que_nf": contagem["itens_menor_que_nf"],
+                "itens_maior_que_nf": contagem["itens_maior_que_nf"],
+                "soma_valor_nf": round(soma_nf,2),
+                "soma_valor_comercial": round(soma_comercial,2),
+                "soma_valor_bonificado": round(soma_bonificado,2),
+                "soma_comercial_mais_bonificado": round(soma_itens,2),
+                "diferenca_liquida_itens_menos_nf": round(soma_itens-soma_nf,2),
+                "soma_valor_produto_itens": round(soma_produto,2),
+                "soma_desconto_item": round(soma_desc_item,2),
+                "soma_frete_item": round(soma_frete,2),
+                "soma_outros_item": round(soma_outros,2),
+                "soma_desconto_nf": round(soma_desc_nf,2),
+            },
+            "meses": meses_saida,
+            "maiores_50_diferencas": maiores[:50],
+            "fontes": fontes,
+            "proximo_passo": "Usar as diferencas e componentes fiscais para definir a formula correta de VALOR_COMERCIAL antes de gravar BASE_VENDAS.",
+        }
+    except Exception as e:
+        return {
+            "status": "error", "ano": 2025, "somente_leitura": True,
+            "error": repr(e), "omie_api_chamada": False,
+            "planilha_principal_alterada": False, "planilha_raw_alterada": False,
+            "base_vendas_alterada": False, "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+        }
+
 # ============================================================
 # AUXILIARES
 # ============================================================
