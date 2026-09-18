@@ -1019,6 +1019,299 @@ def pendentes_com_venda_2025():
             "cursor_2026_alterado": False,
         }
 
+
+# ============================================================
+# PREVIA DEFINITIVA BASE_VENDAS 2025 - SOMENTE LEITURA
+# ============================================================
+
+@app.get("/omie/raw-historico/previa-base-vendas-2025")
+def previa_base_vendas_2025():
+    """
+    Consolida RAW antiga + RAW nova de 2025 por NF, com deduplicacao ID_NF+ID_ITEM.
+    Classifica itens em VENDA/BONIFICACAO/A_VALIDAR/PENDENTE e calcula uma previa
+    mensal da futura BASE_VENDAS. SOMENTE LEITURA: nao chama Omie e nao grava nada.
+    """
+    from collections import defaultdict
+    from datetime import datetime as _dt
+
+    CFOP_VENDA = {
+        "5.101","5.102","5.113","5.401","5.403",
+        "6.101","6.102","6.107","6.108","6.109","6.110",
+        "6.113","6.401","6.403",
+    }
+    CFOP_BONIFICACAO = {"5.910","6.910"}
+    CFOP_A_VALIDAR = {"7.101","7.102"}
+
+    def parse_data(v):
+        s = clean(v)
+        if not s:
+            return None
+        for f in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%Y %H:%M:%S","%Y-%m-%d %H:%M:%S"):
+            try:
+                return _dt.strptime(s[:19], f)
+            except Exception:
+                pass
+        try:
+            return _dt.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def numero(v):
+        s = clean(v)
+        if not s:
+            return 0.0
+        try:
+            if "," in s:
+                return float(s.replace(".", "").replace(",", "."))
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def classe(cfop):
+        if cfop in CFOP_VENDA:
+            return "VENDA"
+        if cfop in CFOP_BONIFICACAO:
+            return "BONIFICACAO"
+        if cfop in CFOP_A_VALIDAR:
+            return "A_VALIDAR"
+        return "PENDENTE"
+
+    try:
+        principal = get_sheets_client()
+        raw = get_raw_historico_sheets_client()
+
+        # Guarda apenas chaves de deduplicacao e o agregado compacto por NF.
+        chaves = set()
+        nfs = {}
+        fontes = {}
+
+        def ler_fonte(client, aba, nome):
+            inicio = 2
+            bloco = 10000
+            linhas_2025 = 0
+            duplicadas = 0
+
+            # A ID_NF, C NUM_NF, E DATA_EMISSAO, G DATA_CANCELAMENTO,
+            # K CNPJ_CPF, L CLIENTE_NOME, M COD_VENDEDOR, O ID_ITEM,
+            # S CFOP, AB VALOR_TOTAL_ITEM, AE VALOR_NF.
+            while True:
+                ranges = [
+                    f"'{aba}'!A{inicio}:A{inicio+bloco-1}",
+                    f"'{aba}'!C{inicio}:C{inicio+bloco-1}",
+                    f"'{aba}'!E{inicio}:E{inicio+bloco-1}",
+                    f"'{aba}'!G{inicio}:G{inicio+bloco-1}",
+                    f"'{aba}'!K{inicio}:K{inicio+bloco-1}",
+                    f"'{aba}'!L{inicio}:L{inicio+bloco-1}",
+                    f"'{aba}'!M{inicio}:M{inicio+bloco-1}",
+                    f"'{aba}'!O{inicio}:O{inicio+bloco-1}",
+                    f"'{aba}'!S{inicio}:S{inicio+bloco-1}",
+                    f"'{aba}'!AB{inicio}:AB{inicio+bloco-1}",
+                    f"'{aba}'!AE{inicio}:AE{inicio+bloco-1}",
+                ]
+                resp = client.api.spreadsheets().values().batchGet(
+                    spreadsheetId=client.spreadsheet_id,
+                    ranges=ranges,
+                    majorDimension="ROWS",
+                ).execute()
+                vr = resp.get("valueRanges") or []
+                cols = [(x.get("values") or []) for x in vr]
+                n = max([len(x) for x in cols] or [0])
+                if n == 0:
+                    break
+
+                def cel(c, i):
+                    if c >= len(cols) or i >= len(cols[c]) or not cols[c][i]:
+                        return ""
+                    return clean(cols[c][i][0])
+
+                for i in range(n):
+                    id_nf = cel(0, i)
+                    num_nf = cel(1, i)
+                    data_txt = cel(2, i)
+                    data = parse_data(data_txt)
+                    if not id_nf or not data or data.year != 2025:
+                        continue
+                    linhas_2025 += 1
+
+                    cancelamento = cel(3, i)
+                    cnpj = cel(4, i)
+                    cliente = cel(5, i)
+                    vendedor = cel(6, i)
+                    id_item = cel(7, i)
+                    cfop = cel(8, i)
+                    valor_item = numero(cel(9, i))
+                    valor_nf = numero(cel(10, i))
+
+                    # As RAWs auditadas possuem ID_ITEM. Se faltar, usa fallback conservador.
+                    chave = f"{id_nf}|{id_item}" if id_item else f"FALLBACK|{id_nf}|{cfop}|{valor_item}|{i+inicio}"
+                    if chave in chaves:
+                        duplicadas += 1
+                        continue
+                    chaves.add(chave)
+
+                    nf = nfs.get(id_nf)
+                    if nf is None:
+                        nf = {
+                            "id_nf": id_nf,
+                            "num_nf": num_nf,
+                            "data_emissao": data_txt,
+                            "mes": data.month,
+                            "data_cancelamento": cancelamento,
+                            "cnpj_cpf": cnpj,
+                            "cliente_nome": cliente,
+                            "cod_vendedor": vendedor,
+                            "valor_nf": valor_nf,
+                            "cfops": set(), "cfops_venda": set(), "cfops_bonificacao": set(),
+                            "cfops_a_validar": set(), "cfops_pendentes": set(),
+                            "qtd_itens": 0, "itens_venda": 0, "itens_bonificados": 0,
+                            "itens_a_validar": 0, "itens_pendentes": 0,
+                            "valor_comercial": 0.0, "valor_bonificado": 0.0,
+                            "valor_a_validar": 0.0, "valor_pendente": 0.0,
+                        }
+                        nfs[id_nf] = nf
+                    else:
+                        # Completa metadados caso a primeira linha esteja vazia.
+                        if not nf["num_nf"] and num_nf: nf["num_nf"] = num_nf
+                        if not nf["data_cancelamento"] and cancelamento: nf["data_cancelamento"] = cancelamento
+                        if not nf["cnpj_cpf"] and cnpj: nf["cnpj_cpf"] = cnpj
+                        if not nf["cliente_nome"] and cliente: nf["cliente_nome"] = cliente
+                        if not nf["cod_vendedor"] and vendedor: nf["cod_vendedor"] = vendedor
+                        if not nf["valor_nf"] and valor_nf: nf["valor_nf"] = valor_nf
+
+                    nf["qtd_itens"] += 1
+                    if cfop:
+                        nf["cfops"].add(cfop)
+                    c = classe(cfop)
+                    if c == "VENDA":
+                        nf["cfops_venda"].add(cfop)
+                        nf["itens_venda"] += 1
+                        nf["valor_comercial"] += valor_item
+                    elif c == "BONIFICACAO":
+                        nf["cfops_bonificacao"].add(cfop)
+                        nf["itens_bonificados"] += 1
+                        nf["valor_bonificado"] += valor_item
+                    elif c == "A_VALIDAR":
+                        if cfop: nf["cfops_a_validar"].add(cfop)
+                        nf["itens_a_validar"] += 1
+                        nf["valor_a_validar"] += valor_item
+                    else:
+                        if cfop: nf["cfops_pendentes"].add(cfop)
+                        nf["itens_pendentes"] += 1
+                        nf["valor_pendente"] += valor_item
+
+                if n < bloco:
+                    break
+                inicio += bloco
+
+            fontes[nome] = {
+                "linhas_2025_lidas": linhas_2025,
+                "duplicidades_ignoradas": duplicadas,
+            }
+
+        ler_fonte(principal, "OMIE_NF", "RAW_ANTIGA")
+        ler_fonte(raw, "OMIE_NF_2025", "RAW_NOVA")
+
+        meses = {m: {
+            "nfs_comerciais": 0, "nfs_comerciais_canceladas": 0,
+            "clientes_unicos": set(), "faturamento_comercial": 0.0,
+            "valor_bonificado": 0.0, "valor_nf_fiscal": 0.0,
+        } for m in range(1, 13)}
+
+        comerciais = []
+        total_canceladas = 0
+        total_comercial = 0.0
+        total_bonificado = 0.0
+        clientes_ano = set()
+
+        for nf in nfs.values():
+            # NF comercial = possui ao menos um item classificado como VENDA.
+            if nf["itens_venda"] <= 0:
+                continue
+            cancelada = bool(clean(nf["data_cancelamento"]))
+            m = nf["mes"]
+            if cancelada:
+                meses[m]["nfs_comerciais_canceladas"] += 1
+                total_canceladas += 1
+            else:
+                meses[m]["nfs_comerciais"] += 1
+                meses[m]["faturamento_comercial"] += nf["valor_comercial"]
+                meses[m]["valor_bonificado"] += nf["valor_bonificado"]
+                meses[m]["valor_nf_fiscal"] += nf["valor_nf"]
+                cliente_key = nf["cnpj_cpf"] or nf["cliente_nome"]
+                if cliente_key:
+                    meses[m]["clientes_unicos"].add(cliente_key)
+                    clientes_ano.add(cliente_key)
+                total_comercial += nf["valor_comercial"]
+                total_bonificado += nf["valor_bonificado"]
+
+            # Apenas pequena amostra; a rota nao devolve 8 mil linhas.
+            if len(comerciais) < 30:
+                comerciais.append({
+                    "id_nf": nf["id_nf"], "num_nf": nf["num_nf"],
+                    "data_emissao": nf["data_emissao"], "cancelada": cancelada,
+                    "cliente_nome": nf["cliente_nome"], "cnpj_cpf": nf["cnpj_cpf"],
+                    "cod_vendedor": nf["cod_vendedor"],
+                    "cfops": sorted(nf["cfops"]),
+                    "cfops_venda": sorted(nf["cfops_venda"]),
+                    "cfops_bonificacao": sorted(nf["cfops_bonificacao"]),
+                    "valor_nf": round(nf["valor_nf"], 2),
+                    "valor_comercial": round(nf["valor_comercial"], 2),
+                    "valor_bonificado": round(nf["valor_bonificado"], 2),
+                    "qtd_itens": nf["qtd_itens"], "itens_venda": nf["itens_venda"],
+                    "itens_bonificados": nf["itens_bonificados"],
+                })
+
+        resumo_mensal = {}
+        for m in range(1, 13):
+            x = meses[m]
+            resumo_mensal[f"{m:02d}"] = {
+                "nfs_comerciais_validas": x["nfs_comerciais"],
+                "nfs_comerciais_canceladas": x["nfs_comerciais_canceladas"],
+                "clientes_unicos": len(x["clientes_unicos"]),
+                "faturamento_comercial": round(x["faturamento_comercial"], 2),
+                "valor_bonificado": round(x["valor_bonificado"], 2),
+                "valor_nf_fiscal": round(x["valor_nf_fiscal"], 2),
+            }
+
+        nfs_com_venda_total = sum(1 for nf in nfs.values() if nf["itens_venda"] > 0)
+        return {
+            "status": "ok", "ano": 2025, "somente_leitura": True,
+            "omie_api_chamada": False, "planilha_principal_alterada": False,
+            "planilha_raw_alterada": False, "base_vendas_alterada": False,
+            "cursor_2025_alterado": False, "cursor_2026_alterado": False,
+            "criterio": {
+                "deduplicacao": "ID_NF + ID_ITEM entre RAW antiga e nova",
+                "nf_comercial": "NF com pelo menos um item CFOP_VENDA",
+                "valor_comercial": "soma de VALOR_TOTAL_ITEM apenas dos itens CFOP_VENDA",
+                "valor_bonificado": "soma de VALOR_TOTAL_ITEM dos itens 5.910/6.910",
+                "canceladas": "separadas e nao somadas no faturamento_comercial da previa",
+                "a_validar": sorted(CFOP_A_VALIDAR),
+            },
+            "resumo_ano": {
+                "itens_unicos_2025": len(chaves),
+                "nfs_unicas_2025": len(nfs),
+                "nfs_com_cfop_venda": nfs_com_venda_total,
+                "nfs_comerciais_validas": nfs_com_venda_total - total_canceladas,
+                "nfs_comerciais_canceladas": total_canceladas,
+                "clientes_unicos_compradores": len(clientes_ano),
+                "faturamento_comercial": round(total_comercial, 2),
+                "valor_bonificado": round(total_bonificado, 2),
+            },
+            "meses": resumo_mensal,
+            "amostra_primeiras_30_nfs_comerciais": comerciais,
+            "fontes": fontes,
+            "base_vendas_alterada": False,
+            "proximo_passo": "Conferir totais mensais/anuais antes de qualquer gravacao em BASE_VENDAS.",
+        }
+    except Exception as e:
+        return {
+            "status": "error", "ano": 2025, "somente_leitura": True,
+            "error": repr(e), "omie_api_chamada": False,
+            "planilha_principal_alterada": False, "planilha_raw_alterada": False,
+            "base_vendas_alterada": False, "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+        }
+
 # ============================================================
 # AUXILIARES
 # ============================================================
