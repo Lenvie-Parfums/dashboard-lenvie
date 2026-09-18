@@ -242,6 +242,133 @@ def preparar_estrutura_raw_historico():
 
 
 # ============================================================
+# NOVA PLANILHA RAW HISTORICO - TESTE CONTROLADO DE UMA PAGINA
+# ============================================================
+
+@app.post("/omie/raw-historico/testar-pagina-2025")
+def testar_pagina_2025_raw(ano: int = 2025, mes: int = 10, pagina: int = 13):
+    """
+    Teste controlado: grava UMA página explícita de 2025 na nova RAW.
+    NÃO lê nem altera o cursor 2025, NÃO altera cursor 2026 e NÃO altera BASE_VENDAS.
+    """
+    import calendar
+
+    try:
+        if ano != 2025 or mes < 1 or mes > 12 or pagina < 1:
+            return {"status": "error", "error": "Parâmetros inválidos para teste 2025."}
+
+        omie = get_omie_client()
+        raw = get_raw_historico_sheets_client()
+        aba = "OMIE_NF_2025"
+
+        headers = [
+            "ID_NF","CHAVE_NFE","NUM_NF","SERIE","DATA_EMISSAO","TIPO_NF",
+            "DATA_CANCELAMENTO","ID_PEDIDO","NUM_PEDIDO","COD_CLIENTE","CNPJ_CPF",
+            "CLIENTE_NOME","COD_VENDEDOR","CATEGORIA","ID_ITEM","COD_PRODUTO_OMIE",
+            "SKU","PRODUTO","CFOP","NCM","QUANTIDADE","UNIDADE","VALOR_UNITARIO",
+            "VALOR_PRODUTO","DESCONTO_ITEM","FRETE_ITEM","OUTROS_ITEM",
+            "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
+        ]
+
+        cab = raw.get(f"'{aba}'!A1:AF1")
+        if not cab or [clean(x) for x in cab[0]] != headers:
+            return {
+                "status": "error",
+                "error": "CABECALHO_RAW_INVALIDO",
+                "cursor_2025_alterado": False,
+                "cursor_2026_alterado": False,
+                "base_vendas_alterada": False,
+            }
+
+        ultimo_dia = calendar.monthrange(ano, mes)[1]
+        resposta = get_omie_client().call(
+            endpoint=ENDPOINTS["nfe"],
+            call="ListarNF",
+            param={
+                "pagina": pagina,
+                "registros_por_pagina": 100,
+                "dEmiInicial": f"01/{mes:02d}/{ano}",
+                "dEmiFinal": f"{ultimo_dia:02d}/{mes:02d}/{ano}",
+            },
+        )
+
+        notas = resposta.get("nfCadastro") or []
+        rows = normalize_nfe(notas)
+        total_paginas = int(resposta.get("total_de_paginas") or 1)
+
+        if pagina > total_paginas:
+            return {
+                "status": "error",
+                "error": "PAGINA_ACIMA_DO_TOTAL",
+                "pagina": pagina,
+                "total_paginas": total_paginas,
+                "cursor_2025_alterado": False,
+                "cursor_2026_alterado": False,
+                "base_vendas_alterada": False,
+            }
+
+        # A nova RAW está vazia neste primeiro teste.
+        # Ainda assim, deduplica dentro da própria página antes do append.
+        def row_key(r):
+            id_nf = clean(r[0]) if len(r) > 0 else ""
+            id_item = clean(r[14]) if len(r) > 14 else ""
+            fallback = "|".join([
+                clean(r[16]) if len(r) > 16 else "",
+                clean(r[18]) if len(r) > 18 else "",
+                clean(r[23]) if len(r) > 23 else "",
+                clean(r[20]) if len(r) > 20 else "",
+            ])
+            return f"{id_nf}|{id_item or fallback}"
+
+        unicas = []
+        chaves = set()
+        for r in rows:
+            if not r:
+                continue
+            k = row_key(r)
+            if k in chaves:
+                continue
+            chaves.add(k)
+            unicas.append(r)
+
+        if unicas:
+            raw.api.spreadsheets().values().append(
+                spreadsheetId=raw.spreadsheet_id,
+                range=f"'{aba}'!A:AF",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": unicas},
+            ).execute()
+
+        return {
+            "status": "ok",
+            "message": "Página de teste gravada somente na nova RAW.",
+            "processado": {"ano": ano, "mes": mes, "pagina": pagina},
+            "total_paginas_mes": total_paginas,
+            "nfs_recebidas": len(notas),
+            "itens_normalizados": len(rows),
+            "itens_gravados_raw": len(unicas),
+            "spreadsheet_raw": raw.spreadsheet_id,
+            "aba_destino": aba,
+            "planilha_principal_alterada": False,
+            "base_vendas_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+            "cron_deve_permanecer_suspenso": True,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": repr(e),
+            "planilha_principal_alterada": False,
+            "base_vendas_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+        }
+
+
+# ============================================================
 # AUXILIARES
 # ============================================================
 
