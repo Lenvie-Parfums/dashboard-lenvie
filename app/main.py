@@ -369,6 +369,120 @@ def testar_pagina_2025_raw(ano: int = 2025, mes: int = 10, pagina: int = 13):
 
 
 # ============================================================
+# AUDITORIA 2025 - SOMENTE LEITURA
+# ============================================================
+
+@app.get("/omie/raw-historico/auditoria-2025")
+def auditoria_historico_2025():
+    """Audita 2025 nas RAW antiga/nova sem gravar, limpar ou mover dados."""
+    from collections import Counter
+    from datetime import datetime as _dt
+
+    HEADER = [
+        "ID_NF","CHAVE_NFE","NUM_NF","SERIE","DATA_EMISSAO","TIPO_NF",
+        "DATA_CANCELAMENTO","ID_PEDIDO","NUM_PEDIDO","COD_CLIENTE","CNPJ_CPF",
+        "CLIENTE_NOME","COD_VENDEDOR","CATEGORIA","ID_ITEM","COD_PRODUTO_OMIE",
+        "SKU","PRODUTO","CFOP","NCM","QUANTIDADE","UNIDADE","VALOR_UNITARIO",
+        "VALOR_PRODUTO","DESCONTO_ITEM","FRETE_ITEM","OUTROS_ITEM",
+        "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
+    ]
+
+    def ano_mes(v):
+        s=clean(v)
+        for f in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%Y %H:%M:%S","%Y-%m-%d %H:%M:%S"):
+            try:
+                d=_dt.strptime(s[:19],f); return d.year,d.month
+            except Exception: pass
+        try:
+            d=_dt.fromisoformat(s.replace("Z","+00:00")); return d.year,d.month
+        except Exception: return None,None
+
+    def ler(client, aba, nome):
+        cab=client.get(f"'{aba}'!A1:AF1")
+        if not cab or [clean(x) for x in cab[0]] != HEADER:
+            raise RuntimeError(f"{nome}: cabecalho A:AF invalido")
+        meses={m:{"linhas":0,"nfs":set(),"keys":Counter(),"sem_item":0,"cfops":Counter()} for m in range(1,13)}
+        inicio=2; bloco=10000; fora=0; invalidas=0
+        while True:
+            dados=client.get(f"'{aba}'!A{inicio}:AF{inicio+bloco-1}")
+            if not dados: break
+            for r in dados:
+                if not r or not any(clean(x) for x in r): continue
+                a,m=ano_mes(r[4] if len(r)>4 else "")
+                if a is None: invalidas+=1; continue
+                if a != 2025: fora+=1; continue
+                idnf=clean(r[0]) if len(r)>0 else ""
+                item=clean(r[14]) if len(r)>14 else ""
+                cfop=clean(r[18]) if len(r)>18 else ""
+                if item:
+                    k=f"{idnf}|{item}"
+                else:
+                    meses[m]["sem_item"]+=1
+                    sku=clean(r[16]) if len(r)>16 else ""
+                    val=clean(r[27]) if len(r)>27 else ""
+                    k=f"FALLBACK|{idnf}|{sku}|{cfop}|{val}"
+                meses[m]["linhas"]+=1
+                if idnf: meses[m]["nfs"].add(idnf)
+                meses[m]["keys"][k]+=1
+                if cfop: meses[m]["cfops"][cfop]+=1
+            if len(dados)<bloco: break
+            inicio+=bloco
+
+        allkeys=Counter(); allnfs=set()
+        resumo={}
+        for m in range(1,13):
+            allkeys.update(meses[m]["keys"]); allnfs.update(meses[m]["nfs"])
+            c=meses[m]["keys"]
+            resumo[f"{m:02d}"]={
+                "linhas":meses[m]["linhas"],
+                "nfs_unicas":len(meses[m]["nfs"]),
+                "chaves_unicas":len(c),
+                "chaves_duplicadas":sum(1 for v in c.values() if v>1),
+                "linhas_duplicadas_extras":sum(v-1 for v in c.values() if v>1),
+                "linhas_sem_id_item":meses[m]["sem_item"],
+                "cfops":dict(sorted(meses[m]["cfops"].items())),
+            }
+        return {
+            "fonte":nome,"aba":aba,
+            "linhas_2025":sum(x["linhas"] for x in meses.values()),
+            "nfs_unicas_2025":len(allnfs),
+            "chaves_unicas_2025":len(allkeys),
+            "chaves_duplicadas_2025":sum(1 for v in allkeys.values() if v>1),
+            "linhas_duplicadas_extras_2025":sum(v-1 for v in allkeys.values() if v>1),
+            "linhas_fora_2025":fora,"datas_invalidas":invalidas,
+            "meses":resumo,"_keys":allkeys,"_nfs":allnfs,
+        }
+
+    try:
+        antiga=ler(get_sheets_client(),"OMIE_NF","RAW_ANTIGA")
+        nova=ler(get_raw_historico_sheets_client(),"OMIE_NF_2025","RAW_NOVA")
+        ka=antiga.pop("_keys"); kn=nova.pop("_keys")
+        na=antiga.pop("_nfs"); nn=nova.pop("_nfs")
+        combinado=Counter(ka); combinado.update(kn)
+        return {
+            "status":"ok","somente_leitura":True,"omie_api_chamada":False,
+            "planilha_principal_alterada":False,"planilha_raw_alterada":False,
+            "base_vendas_alterada":False,"cursor_2025_alterado":False,
+            "cursor_2026_alterado":False,
+            "criterio_duplicidade":"ID_NF + ID_ITEM; fallback diagnostico quando ID_ITEM vazio",
+            "raw_antiga":antiga,"raw_nova":nova,
+            "cruzamento":{
+                "chaves_presentes_nas_duas_fontes":len(set(ka)&set(kn)),
+                "nfs_presentes_nas_duas_fontes":len(na&nn),
+                "chaves_unicas_uniao_2025":len(set(ka)|set(kn)),
+                "nfs_unicas_uniao_2025":len(na|nn),
+                "chaves_duplicadas_considerando_as_duas_fontes":sum(1 for v in combinado.values() if v>1),
+                "linhas_duplicadas_extras_considerando_as_duas_fontes":sum(v-1 for v in combinado.values() if v>1),
+            }
+        }
+    except Exception as e:
+        return {"status":"error","somente_leitura":True,"error":repr(e),
+                "omie_api_chamada":False,"planilha_principal_alterada":False,
+                "planilha_raw_alterada":False,"base_vendas_alterada":False,
+                "cursor_2025_alterado":False,"cursor_2026_alterado":False}
+
+
+# ============================================================
 # AUXILIARES
 # ============================================================
 
