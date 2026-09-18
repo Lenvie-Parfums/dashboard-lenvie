@@ -567,20 +567,53 @@ def previa_nfs_2025(mes: int):
             if not cab or [clean(x) for x in cab[0]] != HEADER:
                 raise RuntimeError(f"{origem}: cabecalho A:AF invalido")
 
+            # ETAPA 1: varre SOMENTE a coluna E (DATA_EMISSAO), que é leve.
+            # Assim evitamos baixar centenas de milhares de linhas A:AF.
             inicio = 2
-            bloco = 5000
-            linhas_lidas = 0
+            bloco_datas = 20000
+            linhas_datas_lidas = 0
             linhas_mes = 0
             duplicadas_ignoradas = 0
+            linhas_alvo = []
 
             while True:
-                dados = client.get(f"'{aba}'!A{inicio}:AF{inicio+bloco-1}")
-                if not dados:
+                datas = client.get(f"'{aba}'!E{inicio}:E{inicio+bloco_datas-1}")
+                if not datas:
                     break
 
-                linhas_lidas += len(dados)
+                linhas_datas_lidas += len(datas)
 
-                for r in dados:
+                for offset, cel in enumerate(datas):
+                    valor = cel[0] if cel else ""
+                    a, m = ano_mes(valor)
+                    if a == 2025 and m == mes:
+                        linhas_alvo.append(inicio + offset)
+
+                if len(datas) < bloco_datas:
+                    break
+                inicio += bloco_datas
+
+            # ETAPA 2: busca A:AF SOMENTE para trechos que realmente contêm
+            # linhas do mês. Agrupa linhas consecutivas e limita cada leitura
+            # a no máximo 500 linhas para reduzir memória/payload do Render.
+            grupos = []
+            if linhas_alvo:
+                ini = ant = linhas_alvo[0]
+                for linha in linhas_alvo[1:]:
+                    if linha == ant + 1 and (linha - ini + 1) <= 500:
+                        ant = linha
+                    else:
+                        grupos.append((ini, ant))
+                        ini = ant = linha
+                grupos.append((ini, ant))
+
+            linhas_detalhes_lidas = 0
+
+            for ini, fim in grupos:
+                dados = client.get(f"'{aba}'!A{ini}:AF{fim}")
+                linhas_detalhes_lidas += len(dados or [])
+
+                for r in (dados or []):
                     if not r or not any(clean(x) for x in r):
                         continue
 
@@ -611,12 +644,11 @@ def previa_nfs_2025(mes: int):
                     itens[chave] = rr
                     origem_por_chave[chave] = origem
 
-                if len(dados) < bloco:
-                    break
-                inicio += bloco
-
             return {
-                "linhas_fisicas_lidas": linhas_lidas,
+                "datas_lidas_coluna_e": linhas_datas_lidas,
+                "linhas_alvo_encontradas": len(linhas_alvo),
+                "linhas_detalhes_a_af_lidas": linhas_detalhes_lidas,
+                "grupos_de_leitura": len(grupos),
                 "linhas_do_mes": linhas_mes,
                 "duplicadas_ignoradas_na_consolidacao": duplicadas_ignoradas,
             }
