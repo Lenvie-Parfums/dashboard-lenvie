@@ -164,8 +164,10 @@ def preparar_estrutura_raw_historico():
                         "addSheet": {
                             "properties": {
                                 "title": aba,
-                                "rowCount": 1000,
-                                "columnCount": 32,
+                                "gridProperties": {
+                                    "rowCount": 1000,
+                                    "columnCount": 32,
+                                },
                             }
                         }
                     }]
