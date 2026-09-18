@@ -62,6 +62,63 @@ def get_sheets_client():
     )
 
 
+RAW_HISTORICO_SPREADSHEET_ID = "1F8mJ6weCB0z7MykKJfm2GbVb3JsfTOJ5fOJeDB8ERv0"
+
+def get_raw_historico_sheets_client():
+    """Cliente separado para a nova planilha RAW histórica."""
+    google_sa_json = os.getenv("GOOGLE_SA_JSON")
+    if not google_sa_json:
+        raise RuntimeError("Variável GOOGLE_SA_JSON não configurada.")
+    try:
+        service_account_info = json.loads(google_sa_json)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("GOOGLE_SA_JSON não contém um JSON válido.") from exc
+    return SheetsClient(
+        service_account_info=service_account_info,
+        spreadsheet_id=RAW_HISTORICO_SPREADSHEET_ID,
+    )
+
+
+# ============================================================
+# NOVA PLANILHA RAW HISTORICO - TESTE SOMENTE LEITURA
+# ============================================================
+
+@app.get("/omie/raw-historico/teste-conexao")
+def teste_conexao_raw_historico():
+    """Somente lê metadados. Não grava e não chama Omie."""
+    try:
+        sheets = get_raw_historico_sheets_client()
+        metadata = (
+            sheets.api.spreadsheets().get(
+                spreadsheetId=sheets.spreadsheet_id,
+                fields="properties.title,sheets.properties.title",
+            ).execute()
+        )
+        abas = [
+            item.get("properties", {}).get("title", "")
+            for item in metadata.get("sheets", [])
+        ]
+        return {
+            "status": "ok",
+            "message": "Conexão somente leitura com a nova planilha RAW realizada com sucesso.",
+            "spreadsheet_id": sheets.spreadsheet_id,
+            "titulo": metadata.get("properties", {}).get("title"),
+            "abas_encontradas": abas,
+            "omie_api_chamada": False,
+            "planilha_alterada": False,
+            "base_vendas_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+        }
+    except Exception as e:
+        return {
+            "status": "error", "error": repr(e),
+            "omie_api_chamada": False, "planilha_alterada": False,
+            "base_vendas_alterada": False,
+            "cursor_2025_alterado": False, "cursor_2026_alterado": False,
+        }
+
+
 # ============================================================
 # AUXILIARES
 # ============================================================
@@ -2196,3 +2253,4 @@ def dashboard_frontend():
 
     return FileResponse(index_path, media_type="text/html")
 
+git add app/main.py
