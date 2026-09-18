@@ -677,84 +677,53 @@ def restaurar_cursor_2025_setembro_7():
 @app.get("/omie/nfe/sync-2025-step")
 def sync_2025_step():
     """
-    Backfill histórico de Jan–Dez/2025, UMA página por execução.
-    Usa cursor separado (OMIE_SYNC_2025_CONTROLE), portanto não altera
-    OMIE_SYNC_CONTROLE de 2026. Faz merge idempotente em OMIE_NF e não
-    altera BASE_VENDAS.
+    Continuação oficial do histórico 2025 na NOVA planilha RAW.
+    O cursor permanece na planilha principal (OMIE_SYNC_2025_CONTROLE).
+    A OMIE_NF antiga e a BASE_VENDAS não são alteradas.
     """
     import calendar
 
     try:
-        sheets = get_sheets_client()
+        principal = get_sheets_client()
+        raw = get_raw_historico_sheets_client()
         controle_aba = "OMIE_SYNC_2025_CONTROLE"
-        get_or_create_sheet(sheets, controle_aba)
+        aba_raw = "OMIE_NF_2025"
 
         headers_ctrl = ["ANO", "MES", "PAGINA", "STATUS", "ATUALIZADO_EM", "ULTIMO_ERRO"]
-        controle = sheets.get(f"{controle_aba}!A1:F10")
+        controle = principal.get(f"{controle_aba}!A1:F10")
 
-        # Segurança: em carga histórica em andamento, cursor ausente/inválido
-        # NÃO pode reiniciar silenciosamente em Jan/2025.
         if not controle or len(controle) < 2:
             return {
-                "status": "error",
-                "error": "CURSOR_2025_AUSENTE",
-                "message": "OMIE_SYNC_2025_CONTROLE está ausente/vazio. Nada foi processado.",
+                "status": "error", "error": "CURSOR_2025_AUSENTE",
+                "message": "Cursor 2025 ausente/vazio. Nada foi processado.",
                 "base_vendas_alterada": False,
-                "controle": controle_aba,
             }
 
-        cab = [clean(x) for x in controle[0]]
-        if cab != headers_ctrl:
+        if [clean(x) for x in controle[0]] != headers_ctrl:
             return {
-                "status": "error",
-                "error": "CURSOR_2025_CABECALHO_INVALIDO",
-                "message": "Cabeçalho do controle 2025 inválido. Nada foi processado.",
+                "status": "error", "error": "CURSOR_2025_CABECALHO_INVALIDO",
+                "message": "Cabeçalho do cursor 2025 inválido. Nada foi processado.",
                 "base_vendas_alterada": False,
-                "controle": controle_aba,
             }
 
-        row = controle[1]
         try:
-            ano = int(clean(row[0]))
-            mes = int(clean(row[1]))
-            pagina = int(clean(row[2]))
+            ano = int(clean(controle[1][0]))
+            mes = int(clean(controle[1][1]))
+            pagina = int(clean(controle[1][2]))
         except Exception:
             return {
-                "status": "error",
-                "error": "CURSOR_2025_INVALIDO",
+                "status": "error", "error": "CURSOR_2025_INVALIDO",
                 "message": "Cursor 2025 inválido. Nada foi processado.",
                 "base_vendas_alterada": False,
-                "controle": controle_aba,
             }
 
         if ano > 2025 or mes > 12:
             return {
-                "status": "ok",
-                "finalizado": True,
+                "status": "ok", "finalizado": True,
                 "message": "Carga histórica Jan–Dez/2025 concluída.",
                 "base_vendas_alterada": False,
-                "controle": controle_aba,
+                "destino": "NOVA_RAW",
             }
-
-        omie = get_omie_client()
-        ultimo_dia = calendar.monthrange(ano, mes)[1]
-        data_inicial = f"01/{mes:02d}/{ano}"
-        data_final = f"{ultimo_dia:02d}/{mes:02d}/{ano}"
-
-        resposta = omie.call(
-            endpoint=ENDPOINTS["nfe"],
-            call="ListarNF",
-            param={
-                "pagina": pagina,
-                "registros_por_pagina": 100,
-                "dEmiInicial": data_inicial,
-                "dEmiFinal": data_final,
-            },
-        )
-
-        notas = resposta.get("nfCadastro") or []
-        total_paginas = int(resposta.get("total_de_paginas") or 1)
-        novas_rows = normalize_nfe(notas)
 
         headers = [
             "ID_NF","CHAVE_NFE","NUM_NF","SERIE","DATA_EMISSAO","TIPO_NF",
@@ -765,14 +734,30 @@ def sync_2025_step():
             "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
         ]
 
-        # Valida somente o cabeçalho completo.
-        cab_atual = sheets.get("OMIE_NF!A1:AF1")
-        if not cab_atual or [clean(x) for x in cab_atual[0]] != headers:
+        cab = raw.get(f"'{aba_raw}'!A1:AF1")
+        if not cab or [clean(x) for x in cab[0]] != headers:
             return {
-                "status": "error",
-                "error": "Cabeçalho da OMIE_NF diferente do contrato. Nada foi alterado.",
-                "controle": controle_aba,
+                "status": "error", "error": "CABECALHO_RAW_INVALIDO",
+                "message": "Cabeçalho da nova RAW inválido. Cursor não avançou.",
+                "base_vendas_alterada": False,
             }
+
+        omie = get_omie_client()
+        ultimo_dia = calendar.monthrange(ano, mes)[1]
+        resposta = omie.call(
+            endpoint=ENDPOINTS["nfe"],
+            call="ListarNF",
+            param={
+                "pagina": pagina,
+                "registros_por_pagina": 100,
+                "dEmiInicial": f"01/{mes:02d}/{ano}",
+                "dEmiFinal": f"{ultimo_dia:02d}/{mes:02d}/{ano}",
+            },
+        )
+
+        notas = resposta.get("nfCadastro") or []
+        total_paginas = int(resposta.get("total_de_paginas") or 1)
+        novas_rows = normalize_nfe(notas)
 
         def row_key(r):
             id_nf = clean(r[0]) if len(r) > 0 else ""
@@ -785,75 +770,32 @@ def sync_2025_step():
             ])
             return f"{id_nf}|{id_item or fallback}"
 
-        # Deduplicação por página:
-        # lê somente ID_NF e ID_ITEM da OMIE_NF existente e mantém em memória
-        # apenas as chaves pertencentes às NFs retornadas pela página atual.
-        # Isso evita materializar 261k+ chaves completas em um set Python.
+        # Como a nova RAW começou pequena, lê apenas A e O dela.
+        # Mantém somente chaves das NFs da página atual.
         ids_nf_pagina = {
             clean(r[0]) for r in novas_rows
             if r and len(r) > 0 and clean(r[0])
         }
 
-        # Varredura em blocos para manter o pico de memória baixo no Render (512 MB).
-        # Em vez de carregar A2:A e O2:O inteiras de uma vez, lê 20 mil linhas
-        # por chamada e descarta o bloco após extrair apenas as chaves das NFs
-        # presentes na página atual da Omie.
-        TAMANHO_BLOCO = 20000
-        linha_inicio = 2
-        total_existente = 0
+        batch = raw.api.spreadsheets().values().batchGet(
+            spreadsheetId=raw.spreadsheet_id,
+            ranges=[f"'{aba_raw}'!A2:A", f"'{aba_raw}'!O2:O"],
+            majorDimension="COLUMNS",
+        ).execute()
+
+        vr = batch.get("valueRanges") or []
+        ids_nf_exist = ((vr[0].get("values") or [[]])[0] if len(vr) > 0 else [])
+        ids_item_exist = ((vr[1].get("values") or [[]])[0] if len(vr) > 1 else [])
+
         chaves_antes = set()
+        for i, id_nf_raw in enumerate(ids_nf_exist):
+            id_nf = clean(id_nf_raw)
+            if not id_nf or id_nf not in ids_nf_pagina:
+                continue
+            id_item = clean(ids_item_exist[i]) if i < len(ids_item_exist) else ""
+            if id_item:
+                chaves_antes.add(f"{id_nf}|{id_item}")
 
-        while True:
-            linha_fim = linha_inicio + TAMANHO_BLOCO - 1
-
-            batch = sheets.api.spreadsheets().values().batchGet(
-                spreadsheetId=sheets.spreadsheet_id,
-                ranges=[
-                    f"'OMIE_NF'!A{linha_inicio}:A{linha_fim}",
-                    f"'OMIE_NF'!O{linha_inicio}:O{linha_fim}",
-                ],
-                majorDimension="COLUMNS",
-            ).execute()
-
-            value_ranges = batch.get("valueRanges") or []
-            ids_nf_bloco = (
-                (value_ranges[0].get("values") or [[]])[0]
-                if len(value_ranges) > 0 else []
-            )
-            ids_item_bloco = (
-                (value_ranges[1].get("values") or [[]])[0]
-                if len(value_ranges) > 1 else []
-            )
-
-            qtd_bloco = len(ids_nf_bloco)
-
-            # ID_NF é obrigatório nas linhas normalizadas. Bloco vazio = fim dos dados.
-            if qtd_bloco == 0:
-                break
-
-            total_existente += qtd_bloco
-
-            for i, id_nf_raw in enumerate(ids_nf_bloco):
-                id_nf = clean(id_nf_raw)
-                if not id_nf or id_nf not in ids_nf_pagina:
-                    continue
-
-                id_item = (
-                    clean(ids_item_bloco[i])
-                    if i < len(ids_item_bloco) else ""
-                )
-                if id_item:
-                    chaves_antes.add(f"{id_nf}|{id_item}")
-
-            # Último bloco parcial: não há necessidade de uma chamada extra.
-            if qtd_bloco < TAMANHO_BLOCO:
-                break
-
-            # Libera referências grandes antes da próxima chamada.
-            del batch, value_ranges, ids_nf_bloco, ids_item_bloco
-            linha_inicio += TAMANHO_BLOCO
-
-        # Escrita incremental: adiciona SOMENTE chaves ainda inexistentes.
         novas_para_append = []
         chaves_append = set()
         for r in novas_rows:
@@ -866,18 +808,17 @@ def sync_2025_step():
                 novas_para_append.append(r)
                 chaves_append.add(k)
 
+        # Só após deduplicação grava na NOVA RAW.
         if novas_para_append:
-            sheets.api.spreadsheets().values().append(
-                spreadsheetId=sheets.spreadsheet_id,
-                range="'OMIE_NF'!A:AF",
+            raw.api.spreadsheets().values().append(
+                spreadsheetId=raw.spreadsheet_id,
+                range=f"'{aba_raw}'!A:AF",
                 valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
                 body={"values": novas_para_append},
             ).execute()
 
-        total_apos_append = total_existente + len(novas_para_append)
-        itens_novos = len(novas_para_append)
-
+        # Cursor avança somente depois do append (ou confirmação de que a página já existia).
         if pagina >= total_paginas:
             prox_mes, prox_pagina = mes + 1, 1
         else:
@@ -885,7 +826,6 @@ def sync_2025_step():
 
         finalizado = prox_mes > 12
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         ctrl_row = [
             2026 if finalizado else 2025,
             1 if finalizado else prox_mes,
@@ -895,10 +835,8 @@ def sync_2025_step():
             "",
         ]
 
-        # Atualiza o cursor diretamente, sem limpar a aba antes.
-        # Assim uma falha entre clear/update não deixa o controle vazio.
-        sheets.api.spreadsheets().values().update(
-            spreadsheetId=sheets.spreadsheet_id,
+        principal.api.spreadsheets().values().update(
+            spreadsheetId=principal.spreadsheet_id,
             range=f"'{controle_aba}'!A1:F2",
             valueInputOption="RAW",
             body={"values": [headers_ctrl, ctrl_row]},
@@ -910,17 +848,20 @@ def sync_2025_step():
             "total_paginas_mes": total_paginas,
             "nfs_recebidas": len(notas),
             "itens_pagina": len(novas_rows),
-            "itens_realmente_novos": itens_novos,
-            "total_itens_omie_nf": total_apos_append,
+            "itens_realmente_novos": len(novas_para_append),
             "proximo": None if finalizado else {
                 "ano": 2025, "mes": prox_mes, "pagina": prox_pagina
             },
             "finalizado": finalizado,
+            "destino": "NOVA_RAW",
+            "spreadsheet_raw": raw.spreadsheet_id,
+            "aba_destino": aba_raw,
+            "omie_nf_antiga_alterada": False,
             "base_vendas_alterada": False,
-            "controle": controle_aba,
+            "cursor_2025_alterado": True,
             "cursor_2026_alterado": False,
             "modo_gravacao": "incremental_append",
-            "modo_deduplicacao": "pagina_em_blocos_20k",
+            "modo_deduplicacao": "id_nf_id_item_na_nova_raw",
         }
 
     except Exception as e:
@@ -928,8 +869,11 @@ def sync_2025_step():
             "status": "error",
             "error": repr(e),
             "message": "Cursor 2025 não avançou; a mesma página poderá ser repetida.",
+            "omie_nf_antiga_alterada": False,
             "base_vendas_alterada": False,
+            "cursor_2026_alterado": False,
         }
+
 
 @app.get("/omie/nfe/sync-historico-step")
 def sync_historico_step():
