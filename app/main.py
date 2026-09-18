@@ -595,12 +595,12 @@ def previa_nfs_2025(mes: int):
 
             # ETAPA 2: busca A:AF SOMENTE para trechos que realmente contêm
             # linhas do mês. Agrupa linhas consecutivas e limita cada leitura
-            # a no máximo 500 linhas para reduzir memória/payload do Render.
+            # a no máximo 2000 linhas, equilibrando memória e quota de leitura do Google Sheets.
             grupos = []
             if linhas_alvo:
                 ini = ant = linhas_alvo[0]
                 for linha in linhas_alvo[1:]:
-                    if linha == ant + 1 and (linha - ini + 1) <= 500:
+                    if linha == ant + 1 and (linha - ini + 1) <= 2000:
                         ant = linha
                     else:
                         grupos.append((ini, ant))
