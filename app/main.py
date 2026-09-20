@@ -1730,6 +1730,156 @@ def validar_formula_liquida_2025():
                 "omie_api_chamada":False,"planilha_principal_alterada":False,"planilha_raw_alterada":False,
                 "base_vendas_alterada":False,"cursor_2025_alterado":False,"cursor_2026_alterado":False}
 
+
+# ============================================================
+# AUDITORIA DE RATEIO VENDA + BONIFICACAO 2025 - SOMENTE LEITURA
+# ============================================================
+
+@app.get("/omie/raw-historico/auditar-rateio-bonificacao-2025")
+def auditar_rateio_bonificacao_2025():
+    """Compara estrategias para retirar bonificacao do VALOR_NF sem gravar dados."""
+    from datetime import datetime as _dt
+
+    CFOP_VENDA = {
+        "5.101","5.102","5.113","5.401","5.403",
+        "6.101","6.102","6.107","6.108","6.109","6.110",
+        "6.113","6.401","6.403",
+    }
+    CFOP_BONIFICACAO = {"5.910","6.910"}
+
+    def parse_data(v):
+        s = clean(v)
+        if not s: return None
+        for f in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%Y %H:%M:%S","%Y-%m-%d %H:%M:%S"):
+            try: return _dt.strptime(s[:19], f)
+            except Exception: pass
+        try: return _dt.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception: return None
+
+    def numero(v):
+        s = clean(v)
+        if not s: return 0.0
+        try: return float(s.replace(".", "").replace(",", ".")) if "," in s else float(s)
+        except Exception: return 0.0
+
+    try:
+        principal = get_sheets_client()
+        raw = get_raw_historico_sheets_client()
+        chaves, nfs, fontes = set(), {}, {}
+
+        def ler_fonte(client, aba, nome):
+            inicio, bloco, linhas_2025, duplicadas = 2, 10000, 0, 0
+            while True:
+                # A ID_NF; C NUM_NF; E DATA; G CANCELAMENTO; O ID_ITEM; S CFOP;
+                # X VALOR_PRODUTO; Y DESCONTO_ITEM; Z FRETE_ITEM; AA OUTROS_ITEM;
+                # AB VALOR_TOTAL_ITEM; AE VALOR_NF
+                letras = ["A","C","E","G","O","S","X","Y","Z","AA","AB","AE"]
+                ranges = [f"'{aba}'!{c}{inicio}:{c}{inicio+bloco-1}" for c in letras]
+                resp = client.api.spreadsheets().values().batchGet(
+                    spreadsheetId=client.spreadsheet_id, ranges=ranges, majorDimension="ROWS"
+                ).execute()
+                cols = [(x.get("values") or []) for x in (resp.get("valueRanges") or [])]
+                n = max([len(x) for x in cols] or [0])
+                if n == 0: break
+
+                def cel(c, i):
+                    if c >= len(cols) or i >= len(cols[c]) or not cols[c][i]: return ""
+                    return clean(cols[c][i][0])
+
+                for i in range(n):
+                    id_nf, data_txt = cel(0,i), cel(2,i)
+                    data = parse_data(data_txt)
+                    if not id_nf or not data or data.year != 2025: continue
+                    linhas_2025 += 1
+                    num_nf, cancelamento, id_item, cfop = cel(1,i), cel(3,i), cel(4,i), cel(5,i)
+                    valor_produto = numero(cel(6,i)); desconto = numero(cel(7,i)); frete = numero(cel(8,i))
+                    outros = numero(cel(9,i)); total_item = numero(cel(10,i)); valor_nf = numero(cel(11,i))
+                    chave = f"{id_nf}|{id_item}" if id_item else f"FALLBACK|{id_nf}|{cfop}|{total_item}|{i+inicio}"
+                    if chave in chaves:
+                        duplicadas += 1; continue
+                    chaves.add(chave)
+                    nf = nfs.setdefault(id_nf, {
+                        "id_nf":id_nf,"num_nf":num_nf,"data_emissao":data_txt,"mes":data.month,
+                        "cancelada":bool(cancelamento),"valor_nf":valor_nf,"cfops":set(),
+                        "itens_venda":0,"itens_bonif":0,
+                        "venda_total":0.0,"bonif_total":0.0,
+                        "venda_liquida":0.0,"bonif_liquida":0.0,
+                        "venda_produto":0.0,"bonif_produto":0.0,
+                    })
+                    if cancelamento: nf["cancelada"] = True
+                    if not nf["valor_nf"] and valor_nf: nf["valor_nf"] = valor_nf
+                    if cfop: nf["cfops"].add(cfop)
+                    liquido = total_item - desconto + frete + outros
+                    if cfop in CFOP_VENDA:
+                        nf["itens_venda"] += 1; nf["venda_total"] += total_item
+                        nf["venda_liquida"] += liquido; nf["venda_produto"] += valor_produto
+                    elif cfop in CFOP_BONIFICACAO:
+                        nf["itens_bonif"] += 1; nf["bonif_total"] += total_item
+                        nf["bonif_liquida"] += liquido; nf["bonif_produto"] += valor_produto
+
+                if n < bloco: break
+                inicio += bloco
+            fontes[nome] = {"linhas_2025_lidas":linhas_2025,"duplicidades_ignoradas":duplicadas}
+
+        ler_fonte(principal, "OMIE_NF", "RAW_ANTIGA")
+        ler_fonte(raw, "OMIE_NF_2025", "RAW_NOVA")
+
+        total = 0; soma_nf = soma_bonif_total = soma_bonif_liq = 0.0
+        soma_metodos = {"nf_menos_bonif_total":0.0,"nf_menos_bonif_liquida":0.0,"rateio_total_item":0.0,"rateio_valor_produto":0.0}
+        meses = {m:{"nfs":0,"valor_nf":0.0,"bonif_total":0.0,"bonif_liquida":0.0,"nf_menos_bonif_total":0.0,"nf_menos_bonif_liquida":0.0,"rateio_total_item":0.0,"rateio_valor_produto":0.0} for m in range(1,13)}
+        exemplos = []
+
+        for nf in nfs.values():
+            if nf["cancelada"] or nf["itens_venda"] <= 0 or nf["itens_bonif"] <= 0: continue
+            total += 1
+            den_total = nf["venda_total"] + nf["bonif_total"]
+            den_prod = nf["venda_produto"] + nf["bonif_produto"]
+            m1 = nf["valor_nf"] - nf["bonif_total"]
+            m2 = nf["valor_nf"] - nf["bonif_liquida"]
+            m3 = nf["valor_nf"] * (nf["venda_total"] / den_total) if den_total else nf["valor_nf"]
+            m4 = nf["valor_nf"] * (nf["venda_produto"] / den_prod) if den_prod else nf["valor_nf"]
+            soma_nf += nf["valor_nf"]; soma_bonif_total += nf["bonif_total"]; soma_bonif_liq += nf["bonif_liquida"]
+            vals={"nf_menos_bonif_total":m1,"nf_menos_bonif_liquida":m2,"rateio_total_item":m3,"rateio_valor_produto":m4}
+            pm=meses[nf["mes"]]; pm["nfs"]+=1; pm["valor_nf"]+=nf["valor_nf"]; pm["bonif_total"]+=nf["bonif_total"]; pm["bonif_liquida"]+=nf["bonif_liquida"]
+            for k,v in vals.items(): soma_metodos[k]+=v; pm[k]+=v
+            exemplos.append({
+                "id_nf":nf["id_nf"],"num_nf":nf["num_nf"],"data_emissao":nf["data_emissao"],"cfops":sorted(nf["cfops"]),
+                "valor_nf":round(nf["valor_nf"],2),"bonificacao_valor_total_item":round(nf["bonif_total"],2),
+                "bonificacao_liquida_item":round(nf["bonif_liquida"],2),"venda_liquida_item":round(nf["venda_liquida"],2),
+                "metodo_nf_menos_bonif_total":round(m1,2),"metodo_nf_menos_bonif_liquida":round(m2,2),
+                "metodo_rateio_total_item":round(m3,2),"metodo_rateio_valor_produto":round(m4,2),
+                "peso_bonificacao_total_item_pct":round((nf["bonif_total"]/den_total*100) if den_total else 0,4),
+                "peso_bonificacao_valor_produto_pct":round((nf["bonif_produto"]/den_prod*100) if den_prod else 0,4),
+            })
+
+        # exemplos mais relevantes: maior peso/valor de bonificacao
+        exemplos.sort(key=lambda x: (x["bonificacao_valor_total_item"], x["valor_nf"]), reverse=True)
+        meses_saida={f"{m:02d}":{k:(v if k=="nfs" else round(v,2)) for k,v in x.items()} for m,x in meses.items()}
+
+        return {
+            "status":"ok","ano":2025,"somente_leitura":True,"omie_api_chamada":False,
+            "planilha_principal_alterada":False,"planilha_raw_alterada":False,"base_vendas_alterada":False,
+            "cursor_2025_alterado":False,"cursor_2026_alterado":False,
+            "criterio":"somente NFs comerciais validas que possuem VENDA + BONIFICACAO (5.910/6.910)",
+            "metodos_comparados":{
+                "nf_menos_bonif_total":"VALOR_NF - soma VALOR_TOTAL_ITEM da bonificacao",
+                "nf_menos_bonif_liquida":"VALOR_NF - soma (VALOR_TOTAL_ITEM - DESCONTO_ITEM + FRETE_ITEM + OUTROS_ITEM) da bonificacao",
+                "rateio_total_item":"VALOR_NF x participacao dos itens de VENDA no VALOR_TOTAL_ITEM classificado",
+                "rateio_valor_produto":"VALOR_NF x participacao dos itens de VENDA no VALOR_PRODUTO classificado",
+            },
+            "resumo":{
+                "nfs_venda_com_bonificacao":total,"soma_valor_nf":round(soma_nf,2),
+                "soma_bonificacao_total_item":round(soma_bonif_total,2),"soma_bonificacao_liquida_item":round(soma_bonif_liq,2),
+                **{k:round(v,2) for k,v in soma_metodos.items()},
+            },
+            "meses":meses_saida,"maiores_50_bonificacoes":exemplos[:50],"fontes":fontes,
+            "proximo_passo":"Comparar os quatro criterios e validar qual representa o faturamento comercial desejado antes de gravar BASE_VENDAS."
+        }
+    except Exception as e:
+        return {"status":"error","ano":2025,"somente_leitura":True,"error":repr(e),"omie_api_chamada":False,
+                "planilha_principal_alterada":False,"planilha_raw_alterada":False,"base_vendas_alterada":False,
+                "cursor_2025_alterado":False,"cursor_2026_alterado":False}
+
 # ============================================================
 # AUXILIARES
 # ============================================================
