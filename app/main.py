@@ -5791,3 +5791,239 @@ def diagnosticar_representantes_staging_2025():
             "base_vendas_alterada": False,
             "staging_alterada": False,
         }
+
+# ============================================================
+# DESCOBRIR NOMES DOS VENDEDORES 2025 NO RAW_JSON - SOMENTE LEITURA
+# ============================================================
+
+@app.get("/omie/base-vendas-2025/descobrir-nomes-vendedores")
+def descobrir_nomes_vendedores_2025():
+    """
+    Procura, SEM chamar a Omie, campos relacionados a vendedor/representante
+    dentro do RAW_JSON das NFs de 2025.
+
+    Lê somente:
+      E  = DATA_EMISSAO
+      M  = COD_VENDEDOR
+      AF = RAW_JSON
+
+    Não altera nenhuma planilha, staging, BASE_VENDAS, RAW ou cursor.
+    """
+    from collections import defaultdict, Counter
+    from datetime import datetime as _dt
+
+    def eh_2025(v):
+        s = clean(v)
+        if not s:
+            return False
+        for f in ("%d/%m/%Y", "%Y-%m-%d",
+                  "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return _dt.strptime(s[:19], f).year == 2025
+            except Exception:
+                pass
+        try:
+            return _dt.fromisoformat(s.replace("Z", "+00:00")).year == 2025
+        except Exception:
+            return False
+
+    def parse_json(v):
+        if isinstance(v, (dict, list)):
+            return v
+        s = clean(v)
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
+
+    # Extrai apenas campos cujo nome sugere vendedor/representante.
+    def extrair(obj, caminho=""):
+        achados = []
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                ks = str(k)
+                kl = ks.lower()
+                novo = f"{caminho}.{ks}" if caminho else ks
+                relacionado = (
+                    "vendedor" in kl
+                    or "represent" in kl
+                    or kl in ("codvend", "cod_vend", "nomevend", "nome_vend")
+                )
+                if relacionado and not isinstance(v, (dict, list)):
+                    valor = clean(v)
+                    if valor:
+                        achados.append((novo, valor))
+                if isinstance(v, (dict, list)):
+                    achados.extend(extrair(v, novo))
+        elif isinstance(obj, list):
+            # Limita a exploração de listas para evitar respostas gigantes.
+            for i, v in enumerate(obj[:20]):
+                if isinstance(v, (dict, list)):
+                    achados.extend(extrair(v, f"{caminho}[{i}]"))
+        return achados
+
+    try:
+        principal = get_sheets_client()
+        raw_novo = get_raw_historico_sheets_client()
+
+        # Códigos realmente usados nas 8.285 linhas da staging.
+        staging = rows_to_objects(
+            principal.get("'BASE_VENDAS_2025_STAGING'!A1:AE20000")
+        )
+        codigos = {
+            clean(r.get("COD_VENDEDOR"))
+            for r in staging
+            if clean(r.get("COD_VENDEDOR"))
+        }
+
+        # codigo -> Counter((caminho, valor))
+        achados_por_codigo = defaultdict(Counter)
+        json_validos_por_codigo = Counter()
+        linhas_2025_por_codigo = Counter()
+        fontes = {}
+
+        def ler_fonte(client, aba, nome):
+            inicio = 2
+            bloco = 20000
+            linhas_lidas = 0
+            linhas_2025 = 0
+            json_validos = 0
+
+            while True:
+                resp = client.api.spreadsheets().values().batchGet(
+                    spreadsheetId=client.spreadsheet_id,
+                    ranges=[
+                        f"'{aba}'!E{inicio}:E{inicio+bloco-1}",
+                        f"'{aba}'!M{inicio}:M{inicio+bloco-1}",
+                        f"'{aba}'!AF{inicio}:AF{inicio+bloco-1}",
+                    ],
+                    majorDimension="ROWS",
+                ).execute()
+
+                vr = resp.get("valueRanges") or []
+                cols = [(x.get("values") or []) for x in vr]
+                n = max([len(x) for x in cols] or [0])
+                if n == 0:
+                    break
+
+                linhas_lidas += n
+
+                def cel(c, i):
+                    if c >= len(cols) or i >= len(cols[c]) or not cols[c][i]:
+                        return ""
+                    return cols[c][i][0]
+
+                for i in range(n):
+                    data = cel(0, i)
+                    if not eh_2025(data):
+                        continue
+
+                    codigo = clean(cel(1, i))
+                    if not codigo or codigo not in codigos:
+                        continue
+
+                    linhas_2025 += 1
+                    linhas_2025_por_codigo[codigo] += 1
+
+                    obj = parse_json(cel(2, i))
+                    if obj is None:
+                        continue
+
+                    json_validos += 1
+                    json_validos_por_codigo[codigo] += 1
+
+                    for caminho, valor in extrair(obj):
+                        # Ignora repetição do próprio código quando não acrescenta nome.
+                        achados_por_codigo[codigo][(caminho, valor)] += 1
+
+                if n < bloco:
+                    break
+                inicio += bloco
+
+            fontes[nome] = {
+                "linhas_lidas": linhas_lidas,
+                "linhas_2025_codigos_staging": linhas_2025,
+                "raw_json_validos": json_validos,
+            }
+
+        ler_fonte(principal, "OMIE_NF", "RAW_ANTIGA")
+        ler_fonte(raw_novo, "OMIE_NF_2025", "RAW_NOVA")
+
+        resultado = []
+        codigos_com_algum_campo = 0
+
+        for codigo in sorted(codigos):
+            candidatos = [
+                {
+                    "caminho_json": caminho,
+                    "valor": valor,
+                    "ocorrencias": qtd,
+                }
+                for (caminho, valor), qtd in achados_por_codigo[codigo].most_common(30)
+            ]
+
+            # Valores textuais diferentes do próprio código são os mais interessantes.
+            possiveis_nomes = []
+            vistos = set()
+            for item in candidatos:
+                valor = clean(item["valor"])
+                if not valor or valor == codigo:
+                    continue
+                # descarta valores puramente numéricos
+                if valor.replace(".", "").replace("-", "").isdigit():
+                    continue
+                chave = valor.upper()
+                if chave in vistos:
+                    continue
+                vistos.add(chave)
+                possiveis_nomes.append({
+                    "valor": valor,
+                    "caminho_json": item["caminho_json"],
+                    "ocorrencias": item["ocorrencias"],
+                })
+
+            if candidatos:
+                codigos_com_algum_campo += 1
+
+            resultado.append({
+                "cod_vendedor": codigo,
+                "linhas_2025_encontradas": linhas_2025_por_codigo[codigo],
+                "raw_json_validos": json_validos_por_codigo[codigo],
+                "possiveis_nomes": possiveis_nomes[:10],
+                "campos_vendedor_representante": candidatos[:20],
+            })
+
+        return {
+            "status": "ok",
+            "somente_leitura": True,
+            "omie_api_chamada": False,
+            "cod_vendedores_staging": len(codigos),
+            "codigos_com_algum_campo_vendedor_no_raw_json": codigos_com_algum_campo,
+            "fontes": fontes,
+            "vendedores": resultado,
+            "base_vendas_alterada": False,
+            "staging_alterada": False,
+            "raw_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+            "proximo_passo": (
+                "Cruzar os possiveis_nomes encontrados com o de-para comercial. "
+                "Se o RAW_JSON nao trouxer nomes, consultar cadastro de vendedores "
+                "por uma rota separada e controlada."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": repr(e),
+            "somente_leitura": True,
+            "omie_api_chamada": False,
+            "base_vendas_alterada": False,
+            "staging_alterada": False,
+            "raw_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+        }
