@@ -6448,3 +6448,289 @@ def previa_mapeamento_representantes_2025():
             "cursor_2025_alterado": False,
             "cursor_2026_alterado": False,
         }
+
+# ============================================================
+# ENRIQUECER STAGING 2025 COM REPRESENTANTE / CANAL
+# COM BACKUP + VALIDACAO FINANCEIRA
+# ============================================================
+
+@app.post("/omie/base-vendas-2025/enriquecer-representantes")
+def enriquecer_representantes_staging_2025(confirmar: str = ""):
+    """
+    Preenche SOMENTE REP_ID (M) e REPRESENTANTE (N) na staging 2025.
+
+    Regras:
+    - representantes externos recebem o nome amigavel validado;
+    - canais proprios/internos recebem o proprio nome do canal;
+    - COD_VENDEDOR 0 e vazio ficam como NAO IDENTIFICADO;
+    - cria backup da staging antes da alteracao;
+    - valida que NFs, faturamento e bonificacao nao mudaram;
+    - NAO altera BASE_VENDAS oficial;
+    - NAO altera RAW nem cursores;
+    - NAO chama Omie.
+    """
+    if confirmar != "SIM":
+        return {
+            "status": "blocked",
+            "message": "Use ?confirmar=SIM",
+            "staging_alterada": False,
+            "base_vendas_alterada": False,
+        }
+
+    MAPA = {
+        "2387586034": ("Eliane", "REPRESENTANTE"),
+        "8823416361": ("Cristian/Túlio", "REPRESENTANTE"),
+        "8877279653": ("Renata", "REPRESENTANTE"),
+        "2387586044": ("Cleo", "REPRESENTANTE"),
+        "2387586147": ("Alex Brito", "REPRESENTANTE"),
+        "8915796128": ("Jefferson", "REPRESENTANTE"),
+        "2387586050": ("Maria Cristina Moura", "REPRESENTANTE"),
+        "2387586114": ("Roberto", "REPRESENTANTE"),
+        "8872496641": ("Filipe", "REPRESENTANTE"),
+        "8872496747": ("Adriano", "REPRESENTANTE"),
+        "8680448510": ("Guara MS", "REPRESENTANTE"),
+        "8742581893": ("Vanessa", "REPRESENTANTE"),
+        "8844199276": ("Divina", "REPRESENTANTE"),
+        "8571472829": ("Aline Fantin", "REPRESENTANTE"),
+        "8549707227": ("Talita", "REPRESENTANTE"),
+        "2387586056": ("Guara MT", "REPRESENTANTE"),
+        "8567684171": ("Khamyla", "REPRESENTANTE"),
+        "8823602589": ("Alda", "REPRESENTANTE"),
+        "8581187715": ("Vandira", "REPRESENTANTE"),
+        "8890603953": ("Patricia", "REPRESENTANTE"),
+        "8549709306": ("Rose", "REPRESENTANTE"),
+        "8567683691": ("Italo", "REPRESENTANTE"),
+        "9058747493": ("Fernanda", "REPRESENTANTE"),
+        "9031958820": ("Robson", "REPRESENTANTE"),
+
+        # Canais proprios / internos: ficam separados dos representantes no dashboard.
+        "2387586048": ("VENDA DIRETA", "CANAL_INTERNO"),
+        "2387586153": ("MARCA PRÓPRIA", "CANAL_INTERNO"),
+        "9027120399": ("SHOP2GETHER", "CANAL_INTERNO"),
+        "2387586036": ("LOJA VIRTUAL", "CANAL_INTERNO"),
+        "9028151573": ("MOSTRUÁRIO", "CANAL_INTERNO"),
+        "2387586041": ("CLEIDE ROMANELLI", "CANAL_INTERNO"),
+        "2436890877": ("MARKETING", "CANAL_INTERNO"),
+        "2437844734": ("SAC", "CANAL_INTERNO"),
+    }
+
+    def numero(v):
+        try:
+            s = clean(v)
+            if not s:
+                return 0.0
+            return float(s.replace(".", "").replace(",", ".")) if "," in s else float(s)
+        except Exception:
+            return 0.0
+
+    try:
+        sheets = get_sheets_client()
+        staging_aba = "BASE_VENDAS_2025_STAGING"
+        backup_aba = "BASE_VENDAS_2025_STAGING_BACKUP_REP"
+
+        vals = sheets.get(f"'{staging_aba}'!A1:AE20000")
+        if not vals or len(vals) < 2:
+            return {
+                "status": "error",
+                "error": "STAGING_VAZIA",
+                "staging_alterada": False,
+                "base_vendas_alterada": False,
+            }
+
+        header = [clean(x) for x in vals[0]]
+        esperado = [
+            "COMPETENCIA","DATA_EMISSAO","ID_NF","CHAVE_NFE","NUM_NF","SERIE",
+            "ID_PEDIDO","NUM_PEDIDO","COD_CLIENTE","CNPJ_CPF","CLIENTE_NOME",
+            "COD_VENDEDOR","REP_ID","REPRESENTANTE","CATEGORIA","VALOR_NF",
+            "VALOR_COMERCIAL","VALOR_EXCLUIDO","VALOR_PENDENTE","TIPO_NF","CFOPS",
+            "CFOPS_VENDA","CFOPS_EXCLUIDOS","CFOPS_PENDENTES","QTD_ITENS",
+            "ITENS_VENDA","ITENS_EXCLUIDOS","ITENS_PENDENTES","QTD_SKUS",
+            "VENDA_VALIDA","MOTIVO",
+        ]
+        if header != esperado:
+            return {
+                "status": "error",
+                "error": "CABECALHO_STAGING_DIFERENTE_DO_CONTRATO",
+                "cabecalho_atual": header,
+                "staging_alterada": False,
+                "base_vendas_alterada": False,
+            }
+
+        rows = [(list(r) + [""] * 31)[:31] for r in vals[1:] if r]
+
+        nfs_antes = len(rows)
+        fat_antes = round(sum(numero(r[16]) for r in rows if clean(r[29]).upper() == "SIM"), 2)
+        bon_antes = round(sum(numero(r[17]) for r in rows if clean(r[29]).upper() == "SIM"), 2)
+
+        if (
+            nfs_antes != 8285
+            or abs(fat_antes - 49550637.37) > 0.05
+            or abs(bon_antes - 381442.32) > 0.05
+        ):
+            return {
+                "status": "error",
+                "error": "STAGING_ORIGINAL_NAO_BATE_COM_TOTAL_APROVADO",
+                "nfs": nfs_antes,
+                "faturamento": fat_antes,
+                "bonificacao": bon_antes,
+                "staging_alterada": False,
+                "base_vendas_alterada": False,
+            }
+
+        # Backup integral ANTES de qualquer alteração.
+        get_or_create_sheet(sheets, backup_aba)
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id,
+            range=f"'{backup_aba}'!A:AE",
+            body={},
+        ).execute()
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,
+            range=f"'{backup_aba}'!A1",
+            valueInputOption="RAW",
+            body={"values": vals},
+        ).execute()
+
+        check_backup = sheets.get(f"'{backup_aba}'!A1:AE20000")
+        if len(check_backup) != len(vals):
+            return {
+                "status": "error",
+                "error": "BACKUP_STAGING_NAO_VALIDADO",
+                "staging_alterada": False,
+                "base_vendas_alterada": False,
+            }
+
+        contagem = {
+            "REPRESENTANTE": 0,
+            "CANAL_INTERNO": 0,
+            "NAO_IDENTIFICADO": 0,
+        }
+        faturamento = {
+            "REPRESENTANTE": 0.0,
+            "CANAL_INTERNO": 0.0,
+            "NAO_IDENTIFICADO": 0.0,
+        }
+        codigos_nao_previstos = set()
+
+        novas = []
+        for r in rows:
+            cod = clean(r[11])
+
+            if cod in MAPA:
+                nome, tipo = MAPA[cod]
+                r[12] = cod              # REP_ID
+                r[13] = nome             # REPRESENTANTE / nome exibido do canal
+            elif cod in ("", "0"):
+                tipo = "NAO_IDENTIFICADO"
+                r[12] = cod
+                r[13] = "NÃO IDENTIFICADO"
+            else:
+                # Segurança: não inventa mapeamento novo.
+                tipo = "NAO_IDENTIFICADO"
+                r[12] = cod
+                r[13] = "NÃO IDENTIFICADO"
+                codigos_nao_previstos.add(cod)
+
+            contagem[tipo] += 1
+            faturamento[tipo] += numero(r[16])
+            novas.append(r)
+
+        if codigos_nao_previstos:
+            return {
+                "status": "error",
+                "error": "COD_VENDEDOR_NAO_PREVISTO_NO_MAPA",
+                "codigos": sorted(codigos_nao_previstos),
+                "backup_criado": True,
+                "staging_alterada": False,
+                "base_vendas_alterada": False,
+            }
+
+        # Atualiza somente M:N. Demais 29 colunas permanecem intocadas.
+        mn = [[r[12], r[13]] for r in novas]
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,
+            range=f"'{staging_aba}'!M2:N{len(novas)+1}",
+            valueInputOption="RAW",
+            body={"values": mn},
+        ).execute()
+
+        # Releitura e validação pós-gravação.
+        pos = sheets.get(f"'{staging_aba}'!A1:AE20000")
+        pos_rows = [(list(r) + [""] * 31)[:31] for r in pos[1:] if r]
+
+        nfs_pos = len(pos_rows)
+        fat_pos = round(sum(numero(r[16]) for r in pos_rows if clean(r[29]).upper() == "SIM"), 2)
+        bon_pos = round(sum(numero(r[17]) for r in pos_rows if clean(r[29]).upper() == "SIM"), 2)
+        reps_vazios = sum(1 for r in pos_rows if not clean(r[13]))
+
+        aprovado = (
+            nfs_pos == nfs_antes == 8285
+            and abs(fat_pos - fat_antes) <= 0.01
+            and abs(bon_pos - bon_antes) <= 0.01
+            and reps_vazios == 0
+        )
+
+        return {
+            "status": "ok" if aprovado else "error",
+            "aprovado": aprovado,
+            "message": (
+                "Staging enriquecida; totais financeiros preservados."
+                if aprovado else
+                "A staging foi gravada, mas a validacao final nao passou. Use o backup."
+            ),
+            "backup_aba": backup_aba,
+            "nfs_antes": nfs_antes,
+            "nfs_depois": nfs_pos,
+            "faturamento_antes": fat_antes,
+            "faturamento_depois": fat_pos,
+            "bonificacao_antes": bon_antes,
+            "bonificacao_depois": bon_pos,
+            "representante_vazio_depois": reps_vazios,
+            "classificacao": {
+                "representantes": {
+                    "nfs": contagem["REPRESENTANTE"],
+                    "faturamento": round(faturamento["REPRESENTANTE"], 2),
+                },
+                "canais_internos": {
+                    "nfs": contagem["CANAL_INTERNO"],
+                    "faturamento": round(faturamento["CANAL_INTERNO"], 2),
+                    "nomes": [
+                        "VENDA DIRETA","MARCA PRÓPRIA","SHOP2GETHER","LOJA VIRTUAL",
+                        "MOSTRUÁRIO","CLEIDE ROMANELLI","MARKETING","SAC"
+                    ],
+                },
+                "nao_identificado": {
+                    "nfs": contagem["NAO_IDENTIFICADO"],
+                    "faturamento": round(faturamento["NAO_IDENTIFICADO"], 2),
+                    "regra": "COD_VENDEDOR vazio ou 0",
+                },
+            },
+            "observacao_dashboard": (
+                "TIPO_CANAL sera derivado no dashboard pelo nome: os oito nomes "
+                "listados em canais_internos => CANAL_INTERNO; NÃO IDENTIFICADO => "
+                "NAO_IDENTIFICADO; demais => REPRESENTANTE. Assim preservamos o "
+                "contrato atual A:AE da BASE_VENDAS."
+            ),
+            "staging_alterada": True,
+            "base_vendas_alterada": False,
+            "raw_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+            "omie_api_chamada": False,
+            "proximo_passo": (
+                "Se aprovado=true, rodar novamente GET /omie/base-vendas-2025/validar-staging "
+                "antes de publicar."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": repr(e),
+            "staging_alterada": False,
+            "base_vendas_alterada": False,
+            "raw_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+            "omie_api_chamada": False,
+        }
