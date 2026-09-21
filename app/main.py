@@ -3938,6 +3938,118 @@ def dashboard_executive_kpis(
         return {"status": "error", "error": str(e)}
 
 
+
+# ============================================================
+# DASHBOARD - CANAIS INTERNOS / REPRESENTANTES
+# ============================================================
+@app.get("/dashboard/canais-internos")
+def dashboard_canais_internos(
+    ano: int = 2025,
+    mes_inicio: int = 1,
+    mes_fim: int = 12,
+):
+    """Resumo dos canais internos separado dos representantes, via BASE_VENDAS."""
+    try:
+        mes_inicio = max(1, min(int(mes_inicio), 12))
+        mes_fim = max(1, min(int(mes_fim), 12))
+        if mes_inicio > mes_fim:
+            mes_inicio, mes_fim = mes_fim, mes_inicio
+
+        canais_internos = {
+            "VENDA DIRETA", "MARCA PRÓPRIA", "SHOP2GETHER", "LOJA VIRTUAL",
+            "MOSTRUÁRIO", "CLEIDE ROMANELLI", "MARKETING", "SAC",
+        }
+        nao_identificado = "NÃO IDENTIFICADO"
+
+        sheets = get_sheets_client()
+        rows = rows_to_objects(sheets.get("BASE_VENDAS!A1:AE50000"))
+
+        def to_float(v):
+            try:
+                return float(str(v).replace(".", "").replace(",", ".")) if isinstance(v, str) and "," in v else float(v or 0)
+            except Exception:
+                return 0.0
+
+        grupos = {}
+        total_geral = 0.0
+        total_canais = 0.0
+        total_representantes = 0.0
+        total_nao_identificado = 0.0
+        nfs_geral = set()
+
+        for row in rows:
+            if clean(row.get("VENDA_VALIDA")).upper() != "SIM":
+                continue
+            competencia = clean(row.get("COMPETENCIA"))
+            try:
+                y, mm = [int(x) for x in competencia[:7].split("-")]
+            except Exception:
+                dt = parse_br_date(row.get("DATA_EMISSAO"))
+                if not dt:
+                    continue
+                y, mm = dt.year, dt.month
+            if y != ano or not (mes_inicio <= mm <= mes_fim):
+                continue
+
+            nome = clean(row.get("REPRESENTANTE")) or nao_identificado
+            valor = to_float(row.get("VALOR_COMERCIAL"))
+            nf = clean(row.get("ID_NF")) or clean(row.get("CHAVE_NFE")) or clean(row.get("NUM_NF"))
+            cliente = clean(row.get("CNPJ_CPF")) or clean(row.get("COD_CLIENTE"))
+
+            total_geral += valor
+            if nf:
+                nfs_geral.add(nf)
+
+            if nome in canais_internos:
+                tipo = "CANAL_INTERNO"
+                total_canais += valor
+            elif nome == nao_identificado:
+                tipo = "NAO_IDENTIFICADO"
+                total_nao_identificado += valor
+            else:
+                tipo = "REPRESENTANTE"
+                total_representantes += valor
+                continue
+
+            g = grupos.setdefault(nome, {"canal": nome, "tipo": tipo, "faturamento": 0.0, "nfs": set(), "clientes": set()})
+            g["faturamento"] += valor
+            if nf:
+                g["nfs"].add(nf)
+            if cliente:
+                g["clientes"].add(cliente)
+
+        detalhe = []
+        for g in grupos.values():
+            fat = round(g["faturamento"], 2)
+            qtd_nfs = len(g["nfs"])
+            qtd_cli = len(g["clientes"])
+            detalhe.append({
+                "canal": g["canal"],
+                "tipo": g["tipo"],
+                "faturamento": fat,
+                "nfs": qtd_nfs,
+                "clientes": qtd_cli,
+                "ticket_medio_nf": round(fat / qtd_nfs, 2) if qtd_nfs else 0.0,
+                "venda_media_cliente": round(fat / qtd_cli, 2) if qtd_cli else 0.0,
+            })
+        detalhe.sort(key=lambda x: x["faturamento"], reverse=True)
+
+        return {
+            "status": "ok",
+            "ano": ano,
+            "mes_inicio": mes_inicio,
+            "mes_fim": mes_fim,
+            "faturamento_total": round(total_geral, 2),
+            "faturamento_representantes": round(total_representantes, 2),
+            "faturamento_canais_internos": round(total_canais, 2),
+            "faturamento_nao_identificado": round(total_nao_identificado, 2),
+            "nfs_total": len(nfs_geral),
+            "canais": detalhe,
+            "fonte": "BASE_VENDAS",
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 # ============================================================
 # FRONTEND V10
 # ============================================================
