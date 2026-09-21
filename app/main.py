@@ -5624,3 +5624,170 @@ def reparar_mes_staging_2025(mes: int, confirmar: str = ""):
             "mes_reparo":mes,
             "base_vendas_alterada":False
         }
+
+# ============================================================
+# DIAGNOSTICO REPRESENTANTES - STAGING 2025 x BASE_VENDAS ATUAL
+# SOMENTE LEITURA
+# ============================================================
+
+@app.get("/omie/base-vendas-2025/diagnosticar-representantes")
+def diagnosticar_representantes_staging_2025():
+    """
+    Compara os COD_VENDEDOR existentes na staging 2025 com os vínculos
+    REP_ID / REPRESENTANTE já existentes na BASE_VENDAS oficial.
+
+    SOMENTE LEITURA:
+    - não altera BASE_VENDAS;
+    - não altera STAGING;
+    - não altera RAW;
+    - não altera cursores.
+    """
+    try:
+        sheets = get_sheets_client()
+
+        staging_values = sheets.get("'BASE_VENDAS_2025_STAGING'!A1:AE20000")
+        base_values = sheets.get("'BASE_VENDAS'!A1:AE50000")
+
+        staging_rows = rows_to_objects(staging_values)
+        base_rows = rows_to_objects(base_values)
+
+        # Mapeamentos observados na BASE_VENDAS oficial:
+        # COD_VENDEDOR -> {(REP_ID, REPRESENTANTE): qtd}
+        mapa = {}
+        for row in base_rows:
+            cod = clean(row.get("COD_VENDEDOR"))
+            rep_id = clean(row.get("REP_ID"))
+            rep = clean(row.get("REPRESENTANTE"))
+
+            if not cod or (not rep_id and not rep):
+                continue
+
+            chave = (rep_id, rep)
+            mapa.setdefault(cod, {})
+            mapa[cod][chave] = mapa[cod].get(chave, 0) + 1
+
+        # Universo 2025 na staging.
+        stats = {}
+        linhas_rep_preenchido = 0
+        linhas_rep_vazio = 0
+
+        for row in staging_rows:
+            cod = clean(row.get("COD_VENDEDOR"))
+            if not cod:
+                cod = "(VAZIO)"
+
+            rep_id_atual = clean(row.get("REP_ID"))
+            rep_atual = clean(row.get("REPRESENTANTE"))
+
+            if rep_id_atual or rep_atual:
+                linhas_rep_preenchido += 1
+            else:
+                linhas_rep_vazio += 1
+
+            if cod not in stats:
+                stats[cod] = {
+                    "cod_vendedor": cod,
+                    "nfs_2025": 0,
+                    "faturamento_2025": 0.0,
+                    "rep_id_atual_staging": set(),
+                    "representante_atual_staging": set(),
+                }
+
+            stats[cod]["nfs_2025"] += 1
+
+            try:
+                v = row.get("VALOR_COMERCIAL")
+                if isinstance(v, (int, float)):
+                    valor = float(v)
+                else:
+                    s = clean(v).replace("R$", "").replace(" ", "")
+                    if "," in s:
+                        s = s.replace(".", "").replace(",", ".")
+                    valor = float(s or 0)
+            except Exception:
+                valor = 0.0
+
+            stats[cod]["faturamento_2025"] += valor
+
+            if rep_id_atual:
+                stats[cod]["rep_id_atual_staging"].add(rep_id_atual)
+            if rep_atual:
+                stats[cod]["representante_atual_staging"].add(rep_atual)
+
+        resultado = []
+        mapeados_unicos = 0
+        ambiguos = 0
+        sem_mapeamento = 0
+        nfs_sem_mapeamento = 0
+        faturamento_sem_mapeamento = 0.0
+
+        for cod, st in stats.items():
+            candidatos_raw = mapa.get(cod, {})
+            candidatos = [
+                {
+                    "rep_id": rep_id,
+                    "representante": rep,
+                    "ocorrencias_base_atual": qtd,
+                }
+                for (rep_id, rep), qtd in sorted(
+                    candidatos_raw.items(),
+                    key=lambda x: (-x[1], x[0][1], x[0][0])
+                )
+            ]
+
+            if len(candidatos) == 1:
+                status = "MAPEAMENTO_UNICO"
+                mapeados_unicos += 1
+            elif len(candidatos) > 1:
+                status = "AMBIGUO"
+                ambiguos += 1
+            else:
+                status = "SEM_MAPEAMENTO"
+                sem_mapeamento += 1
+                nfs_sem_mapeamento += st["nfs_2025"]
+                faturamento_sem_mapeamento += st["faturamento_2025"]
+
+            resultado.append({
+                "cod_vendedor": cod,
+                "nfs_2025": st["nfs_2025"],
+                "faturamento_2025": round(st["faturamento_2025"], 2),
+                "rep_id_atual_staging": sorted(st["rep_id_atual_staging"]),
+                "representante_atual_staging": sorted(st["representante_atual_staging"]),
+                "status_mapeamento": status,
+                "candidatos_base_vendas_atual": candidatos,
+            })
+
+        resultado.sort(key=lambda x: (-x["nfs_2025"], x["cod_vendedor"]))
+
+        return {
+            "status": "ok",
+            "somente_leitura": True,
+            "linhas_staging_2025": len(staging_rows),
+            "linhas_com_rep_preenchido": linhas_rep_preenchido,
+            "linhas_com_rep_vazio": linhas_rep_vazio,
+            "cod_vendedores_distintos_2025": len(stats),
+            "cod_vendedores_com_mapeamento_unico": mapeados_unicos,
+            "cod_vendedores_ambiguos": ambiguos,
+            "cod_vendedores_sem_mapeamento": sem_mapeamento,
+            "nfs_sem_mapeamento": nfs_sem_mapeamento,
+            "faturamento_sem_mapeamento": round(faturamento_sem_mapeamento, 2),
+            "vendedores": resultado,
+            "base_vendas_alterada": False,
+            "staging_alterada": False,
+            "raw_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+            "proximo_passo": (
+                "Usar este diagnostico para montar o de-para e somente depois "
+                "preencher REP_ID/REPRESENTANTE na staging."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": repr(e),
+            "somente_leitura": True,
+            "base_vendas_alterada": False,
+            "staging_alterada": False,
+        }
