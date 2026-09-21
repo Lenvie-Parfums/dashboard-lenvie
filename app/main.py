@@ -4610,3 +4610,381 @@ def gravar_base_vendas_2025(confirmar: str = ""):
             "cursor_2025_alterado": False,
             "cursor_2026_alterado": False,
         }
+
+# ============================================================
+# BASE_VENDAS 2025 - CARGA PARCELADA / STAGING
+# ============================================================
+
+@app.post("/omie/base-vendas-2025/preparar")
+def preparar_base_vendas_2025(confirmar: str = ""):
+    """
+    Prepara uma staging temporária para 2025.
+    Não chama Omie, não altera RAW, não altera BASE_VENDAS e não altera cursores.
+    """
+    if confirmar != "SIM":
+        return {"status":"blocked","message":"Use ?confirmar=SIM","base_vendas_alterada":False}
+
+    try:
+        sheets = get_sheets_client()
+        staging = "BASE_VENDAS_2025_STAGING"
+        controle = "BASE_VENDAS_2025_CONTROLE"
+
+        headers = [
+            "COMPETENCIA","DATA_EMISSAO","ID_NF","CHAVE_NFE","NUM_NF","SERIE",
+            "ID_PEDIDO","NUM_PEDIDO","COD_CLIENTE","CNPJ_CPF","CLIENTE_NOME",
+            "COD_VENDEDOR","REP_ID","REPRESENTANTE","CATEGORIA","VALOR_NF",
+            "VALOR_COMERCIAL","VALOR_EXCLUIDO","VALOR_PENDENTE","TIPO_NF","CFOPS",
+            "CFOPS_VENDA","CFOPS_EXCLUIDOS","CFOPS_PENDENTES","QTD_ITENS",
+            "ITENS_VENDA","ITENS_EXCLUIDOS","ITENS_PENDENTES","QTD_SKUS",
+            "VENDA_VALIDA","MOTIVO",
+        ]
+        get_or_create_sheet(sheets, staging)
+        get_or_create_sheet(sheets, controle)
+
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id, range=f"'{staging}'!A:AE", body={}
+        ).execute()
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id, range=f"'{staging}'!A1",
+            valueInputOption="RAW", body={"values":[headers]}
+        ).execute()
+
+        ctrl_headers = ["ANO","PROXIMO_MES","STATUS","ATUALIZADO_EM","ULTIMO_ERRO"]
+        ctrl = [2025,1,"PREPARADO",datetime.now().strftime("%Y-%m-%d %H:%M:%S"),""]
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id, range=f"'{controle}'!A:E", body={}
+        ).execute()
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id, range=f"'{controle}'!A1",
+            valueInputOption="RAW", body={"values":[ctrl_headers,ctrl]}
+        ).execute()
+
+        return {
+            "status":"ok","message":"Staging 2025 preparada.",
+            "proximo_mes":1,"base_vendas_alterada":False,
+            "omie_api_chamada":False,"raw_alterada":False,
+            "cursor_2025_alterado":False,"cursor_2026_alterado":False,
+        }
+    except Exception as e:
+        return {"status":"error","error":repr(e),"base_vendas_alterada":False}
+
+
+@app.post("/omie/base-vendas-2025/processar-mes")
+def processar_mes_base_vendas_2025(confirmar: str = ""):
+    """
+    Processa APENAS o próximo mês do cursor da staging.
+    Lê RAW antiga + RAW nova e grava somente a staging.
+    BASE_VENDAS oficial permanece intocada.
+    """
+    from datetime import datetime as _dt
+
+    if confirmar != "SIM":
+        return {"status":"blocked","message":"Use ?confirmar=SIM","base_vendas_alterada":False}
+
+    CFOP_VENDA = {
+        "5.101","5.102","5.113","5.401","5.403",
+        "6.101","6.102","6.107","6.108","6.109","6.110","6.113","6.401","6.403",
+    }
+    CFOP_BONIFICACAO = {"5.910","6.910"}
+    HEADER_RAW = [
+        "ID_NF","CHAVE_NFE","NUM_NF","SERIE","DATA_EMISSAO","TIPO_NF",
+        "DATA_CANCELAMENTO","ID_PEDIDO","NUM_PEDIDO","COD_CLIENTE","CNPJ_CPF",
+        "CLIENTE_NOME","COD_VENDEDOR","CATEGORIA","ID_ITEM","COD_PRODUTO_OMIE",
+        "SKU","PRODUTO","CFOP","NCM","QUANTIDADE","UNIDADE","VALOR_UNITARIO",
+        "VALOR_PRODUTO","DESCONTO_ITEM","FRETE_ITEM","OUTROS_ITEM",
+        "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
+    ]
+
+    def dt(v):
+        s=clean(v)
+        for f in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%Y %H:%M:%S","%Y-%m-%d %H:%M:%S"):
+            try: return _dt.strptime(s[:19],f)
+            except Exception: pass
+        try: return _dt.fromisoformat(s.replace("Z","+00:00"))
+        except Exception: return None
+
+    def num(v):
+        s=clean(v)
+        if not s: return 0.0
+        try:
+            return float(s.replace(".","").replace(",",".")) if "," in s else float(s)
+        except Exception: return 0.0
+
+    def is_cancel(v):
+        return clean(v).lower() not in ("","none","null","0","false","não","nao")
+
+    try:
+        principal=get_sheets_client()
+        raw=get_raw_historico_sheets_client()
+        staging="BASE_VENDAS_2025_STAGING"
+        controle="BASE_VENDAS_2025_CONTROLE"
+
+        ctrl=principal.get(f"'{controle}'!A1:E2")
+        if not ctrl or len(ctrl)<2:
+            return {"status":"error","error":"CONTROLE_STAGING_AUSENTE","base_vendas_alterada":False}
+        mes=int(clean(ctrl[1][1]) or 1)
+        if mes>12:
+            return {"status":"ok","finalizado":True,"message":"Os 12 meses já foram processados.","base_vendas_alterada":False}
+
+        # Busca somente as linhas físicas do mês, primeiro pela coluna E.
+        itens={}
+        duplicadas={"RAW_ANTIGA":0,"RAW_NOVA":0}
+
+        def carregar_mes(client, aba, origem):
+            cab=client.get(f"'{aba}'!A1:AF1")
+            if not cab or [clean(x) for x in cab[0]] != HEADER_RAW:
+                raise RuntimeError(f"{origem}: CABECALHO_RAW_INVALIDO")
+
+            alvo=[]
+            inicio=2
+            bloco=20000
+            while True:
+                datas=client.get(f"'{aba}'!E{inicio}:E{inicio+bloco-1}")
+                if not datas: break
+                for off, cel in enumerate(datas):
+                    d=dt(cel[0] if cel else "")
+                    if d and d.year==2025 and d.month==mes:
+                        alvo.append(inicio+off)
+                if len(datas)<bloco: break
+                inicio+=bloco
+
+            grupos=[]
+            if alvo:
+                ini=ant=alvo[0]
+                for linha in alvo[1:]:
+                    if linha==ant+1 and (linha-ini+1)<=2000:
+                        ant=linha
+                    else:
+                        grupos.append((ini,ant)); ini=ant=linha
+                grupos.append((ini,ant))
+
+            for ini,fim in grupos:
+                dados=client.get(f"'{aba}'!A{ini}:AF{fim}")
+                for r in (dados or []):
+                    rr=list(r)+[""]*(32-len(r)); rr=rr[:32]
+                    d=dt(rr[4])
+                    if not d or d.year!=2025 or d.month!=mes: continue
+                    idnf=clean(rr[0]); item=clean(rr[14])
+                    if not idnf: continue
+                    chave=f"{idnf}|{item}" if item else "FALLBACK|"+"|".join(
+                        [idnf,clean(rr[16]),clean(rr[18]),clean(rr[20]),clean(rr[27])]
+                    )
+                    if chave in itens:
+                        duplicadas[origem]+=1
+                        continue
+                    itens[chave]=rr
+            return {"linhas_alvo":len(alvo),"grupos":len(grupos)}
+
+        carga_antiga=carregar_mes(principal,"OMIE_NF","RAW_ANTIGA")
+        carga_nova=carregar_mes(raw,"OMIE_NF_2025","RAW_NOVA")
+
+        nfs={}
+        for r in itens.values():
+            idnf=clean(r[0])
+            if idnf not in nfs:
+                d=dt(r[4])
+                nfs[idnf]={
+                    "data":clean(r[4]),"mes":d.month if d else mes,"id":idnf,
+                    "chave":clean(r[1]),"num":clean(r[2]),"serie":clean(r[3]),
+                    "tipo":clean(r[5]),"cancel":clean(r[6]),"idped":clean(r[7]),
+                    "numped":clean(r[8]),"codcli":clean(r[9]),"cnpj":clean(r[10]),
+                    "cliente":clean(r[11]),"vend":clean(r[12]),"cat":clean(r[13]),
+                    "valor_nf":num(r[30]),"cfops":set(),"venda":set(),"bonif":set(),
+                    "pend":set(),"skus":set(),"qtd":0,"iv":0,"ib":0,"ip":0,"vb":0.0
+                }
+            nf=nfs[idnf]
+            if not nf["cancel"] and clean(r[6]): nf["cancel"]=clean(r[6])
+            if not nf["valor_nf"] and num(r[30]): nf["valor_nf"]=num(r[30])
+            cfop=clean(r[18]); sku=clean(r[16])
+            nf["qtd"]+=1
+            if cfop: nf["cfops"].add(cfop)
+            if sku: nf["skus"].add(sku)
+            if cfop in CFOP_VENDA:
+                nf["venda"].add(cfop); nf["iv"]+=1
+            elif cfop in CFOP_BONIFICACAO:
+                nf["bonif"].add(cfop); nf["ib"]+=1; nf["vb"]+=num(r[27])
+            elif cfop:
+                nf["pend"].add(cfop); nf["ip"]+=1
+
+        rows=[]
+        canceladas=0
+        for nf in nfs.values():
+            if not nf["venda"]: continue
+            if is_cancel(nf["cancel"]):
+                canceladas+=1
+                continue
+            vnf=round(nf["valor_nf"],2)
+            vb=round(nf["vb"],2)
+            vc=round(vnf-vb,2)
+            rows.append([
+                f"2025-{mes:02d}",nf["data"],nf["id"],nf["chave"],nf["num"],nf["serie"],
+                nf["idped"],nf["numped"],nf["codcli"],nf["cnpj"],nf["cliente"],nf["vend"],
+                nf["vend"],"",nf["cat"],vnf,vc,vb,0.0,nf["tipo"],
+                ";".join(sorted(nf["cfops"])),";".join(sorted(nf["venda"])),
+                ";".join(sorted(nf["bonif"])),";".join(sorted(nf["pend"])),
+                nf["qtd"],nf["iv"],nf["ib"],nf["ip"],len(nf["skus"]),"SIM",
+                "VENDA_COM_BONIFICACAO" if vb else "VENDA"
+            ])
+
+        rows.sort(key=lambda x:(x[1],x[4]))
+
+        # Idempotência: se o mês já existir na staging, remove apenas aquele mês e regrava.
+        atual=principal.get(f"'{staging}'!A1:AE20000")
+        if not atual:
+            raise RuntimeError("STAGING_AUSENTE")
+        header=atual[0]
+        manter=[]
+        for r in atual[1:]:
+            rr=list(r)+[""]*(31-len(r)); rr=rr[:31]
+            if clean(rr[0]) != f"2025-{mes:02d}":
+                manter.append(rr)
+
+        novo=[header]+manter+rows
+        principal.api.spreadsheets().values().clear(
+            spreadsheetId=principal.spreadsheet_id,range=f"'{staging}'!A2:AE",body={}
+        ).execute()
+        principal.api.spreadsheets().values().update(
+            spreadsheetId=principal.spreadsheet_id,range=f"'{staging}'!A1",
+            valueInputOption="RAW",body={"values":novo}
+        ).execute()
+
+        prox=mes+1
+        status="FINALIZADO" if prox>12 else "EM_ANDAMENTO"
+        ctrlrow=[2025,prox,status,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),""]
+        principal.api.spreadsheets().values().update(
+            spreadsheetId=principal.spreadsheet_id,range=f"'{controle}'!A1",
+            valueInputOption="RAW",
+            body={"values":[["ANO","PROXIMO_MES","STATUS","ATUALIZADO_EM","ULTIMO_ERRO"],ctrlrow]}
+        ).execute()
+
+        return {
+            "status":"ok","mes_processado":mes,"nfs_validas_gravadas_staging":len(rows),
+            "canceladas":canceladas,
+            "faturamento_mes":round(sum(float(r[16]) for r in rows),2),
+            "bonificacao_mes":round(sum(float(r[17]) for r in rows),2),
+            "itens_unicos_mes":len(itens),"duplicidades_ignoradas":duplicadas,
+            "carga":{"raw_antiga":carga_antiga,"raw_nova":carga_nova},
+            "proximo_mes":None if prox>12 else prox,"finalizado":prox>12,
+            "base_vendas_alterada":False,"omie_api_chamada":False,"raw_alterada":False,
+            "cursor_2025_alterado":False,"cursor_2026_alterado":False,
+        }
+    except Exception as e:
+        return {"status":"error","error":repr(e),"base_vendas_alterada":False}
+
+
+@app.get("/omie/base-vendas-2025/validar-staging")
+def validar_staging_base_vendas_2025():
+    """Validação leve da staging; não grava nada."""
+    try:
+        sheets=get_sheets_client()
+        vals=sheets.get("'BASE_VENDAS_2025_STAGING'!A1:AE20000")
+        rows=rows_to_objects(vals)
+        def num(v):
+            try:
+                s=clean(v)
+                return float(s.replace(".","").replace(",",".")) if "," in s else float(s or 0)
+            except Exception: return 0.0
+        validas=[r for r in rows if clean(r.get("VENDA_VALIDA")).upper()=="SIM"]
+        fat=round(sum(num(r.get("VALOR_COMERCIAL")) for r in validas),2)
+        bon=round(sum(num(r.get("VALOR_EXCLUIDO")) for r in validas),2)
+        meses={}
+        for m in range(1,13):
+            comp=f"2025-{m:02d}"
+            rr=[r for r in validas if clean(r.get("COMPETENCIA"))==comp]
+            meses[f"{m:02d}"]={"nfs":len(rr),"faturamento":round(sum(num(x.get("VALOR_COMERCIAL")) for x in rr),2)}
+        aprovado=(len(validas)==8285 and abs(fat-49550637.37)<=0.05 and abs(bon-381442.32)<=0.05)
+        return {
+            "status":"ok","aprovado_para_publicacao":aprovado,
+            "nfs":len(validas),"faturamento":fat,"bonificacao":bon,"meses":meses,
+            "esperado":{"nfs":8285,"faturamento":49550637.37,"bonificacao":381442.32},
+            "base_vendas_alterada":False
+        }
+    except Exception as e:
+        return {"status":"error","error":repr(e),"base_vendas_alterada":False}
+
+
+@app.post("/omie/base-vendas-2025/publicar")
+def publicar_base_vendas_2025(confirmar: str = ""):
+    """
+    Publica staging somente se os totais finais baterem.
+    Cria backup completo antes. Preserva todas as linhas não-2025, inclusive 2026.
+    """
+    from datetime import datetime as _dt
+    if confirmar!="SIM":
+        return {"status":"blocked","message":"Use ?confirmar=SIM","base_vendas_alterada":False}
+
+    def ano_linha(r):
+        comp=clean(r[0] if len(r)>0 else "")
+        if comp.startswith("2025-"): return 2025
+        data=clean(r[1] if len(r)>1 else "")
+        for f in ("%d/%m/%Y","%Y-%m-%d"):
+            try: return _dt.strptime(data[:10],f).year
+            except Exception: pass
+        return None
+
+    def num(v):
+        try:
+            s=clean(v)
+            return float(s.replace(".","").replace(",",".")) if "," in s else float(s or 0)
+        except Exception:return 0.0
+
+    try:
+        sheets=get_sheets_client()
+        staging=sheets.get("'BASE_VENDAS_2025_STAGING'!A1:AE20000")
+        if not staging or len(staging)<2:
+            return {"status":"error","error":"STAGING_VAZIA","base_vendas_alterada":False}
+
+        srows=[(list(r)+[""]*31)[:31] for r in staging[1:] if r]
+        fat=round(sum(num(r[16]) for r in srows if clean(r[29]).upper()=="SIM"),2)
+        bon=round(sum(num(r[17]) for r in srows if clean(r[29]).upper()=="SIM"),2)
+        if len(srows)!=8285 or abs(fat-49550637.37)>0.05 or abs(bon-381442.32)>0.05:
+            return {
+                "status":"error","error":"STAGING_NAO_APROVADA",
+                "nfs":len(srows),"faturamento":fat,"bonificacao":bon,
+                "base_vendas_alterada":False
+            }
+
+        atual=sheets.get("BASE_VENDAS!A1:AE50000")
+        if not atual:
+            return {"status":"error","error":"BASE_VENDAS_VAZIA","base_vendas_alterada":False}
+
+        header=atual[0]
+        outros=[]
+        for r in atual[1:]:
+            rr=(list(r)+[""]*31)[:31]
+            if ano_linha(rr)!=2025:
+                outros.append(rr)
+
+        # Backup completo.
+        backup="BASE_VENDAS_BACKUP_2025"
+        get_or_create_sheet(sheets,backup)
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id,range=f"'{backup}'!A:AE",body={}
+        ).execute()
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,range=f"'{backup}'!A1",
+            valueInputOption="RAW",body={"values":atual}
+        ).execute()
+        check=sheets.get(f"'{backup}'!A1:AE50000")
+        if len(check)!=len(atual):
+            return {"status":"error","error":"BACKUP_NAO_VALIDADO","base_vendas_alterada":False}
+
+        final=[header]+srows+outros
+        sheets.api.spreadsheets().values().clear(
+            spreadsheetId=sheets.spreadsheet_id,range="'BASE_VENDAS'!A2:AE",body={}
+        ).execute()
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,range="'BASE_VENDAS'!A1",
+            valueInputOption="RAW",body={"values":final}
+        ).execute()
+
+        return {
+            "status":"ok","message":"BASE_VENDAS 2025 publicada com backup.",
+            "nfs_2025":len(srows),"faturamento_2025":fat,"bonificacao_2025":bon,
+            "linhas_outros_anos_preservadas":len(outros),"backup_aba":backup,
+            "omie_api_chamada":False,"raw_alterada":False,
+            "cursor_2025_alterado":False,"cursor_2026_alterado":False,
+            "base_vendas_alterada":True
+        }
+    except Exception as e:
+        return {"status":"error","error":repr(e)}
