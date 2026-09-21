@@ -6027,3 +6027,194 @@ def descobrir_nomes_vendedores_2025():
             "cursor_2025_alterado": False,
             "cursor_2026_alterado": False,
         }
+
+# ============================================================
+# OMIE - CADASTRO DE VENDEDORES PARA OS CODIGOS DA STAGING 2025
+# CONSULTA CONTROLADA / SOMENTE LEITURA
+# ============================================================
+
+@app.get("/omie/base-vendas-2025/consultar-cadastro-vendedores")
+def consultar_cadastro_vendedores_2025():
+    """
+    Consulta o cadastro de vendedores da Omie e cruza com os COD_VENDEDOR
+    existentes na BASE_VENDAS_2025_STAGING.
+
+    Segurança:
+    - somente leitura;
+    - não altera BASE_VENDAS;
+    - não altera STAGING;
+    - não altera RAW;
+    - não altera cursores;
+    - faz somente chamadas de consulta à Omie.
+    """
+    try:
+        principal = get_sheets_client()
+
+        staging = rows_to_objects(
+            principal.get("'BASE_VENDAS_2025_STAGING'!A1:AE20000")
+        )
+        codigos = sorted({
+            clean(r.get("COD_VENDEDOR"))
+            for r in staging
+            if clean(r.get("COD_VENDEDOR"))
+        })
+
+        omie = get_omie_client()
+
+        # Endpoint oficial do cadastro de vendedores/equipe.
+        # Usamos chamada paginada pequena e paramos assim que todas as páginas
+        # informadas pela Omie forem percorridas.
+        endpoint = "https://app.omie.com.br/api/v1/geral/vendedores/"
+        pagina = 1
+        registros_por_pagina = 100
+        total_paginas = 1
+        registros = []
+        chamadas = 0
+
+        while pagina <= total_paginas:
+            resp = omie.call(
+                endpoint=endpoint,
+                call="ListarVendedores",
+                param={
+                    "pagina": pagina,
+                    "registros_por_pagina": registros_por_pagina,
+                    "apenas_importado_api": "N",
+                },
+            )
+            chamadas += 1
+
+            lista = (
+                resp.get("cadastro")
+                or resp.get("vendedores")
+                or resp.get("vendedorCadastro")
+                or resp.get("listaVendedores")
+                or []
+            )
+            if isinstance(lista, dict):
+                lista = [lista]
+            registros.extend(lista)
+
+            try:
+                total_paginas = int(
+                    resp.get("total_de_paginas")
+                    or resp.get("total_paginas")
+                    or 1
+                )
+            except Exception:
+                total_paginas = 1
+
+            pagina += 1
+
+            # Trava adicional de segurança contra resposta inesperada.
+            if chamadas >= 50:
+                break
+
+        def primeiro(d, nomes):
+            for nome in nomes:
+                if nome in d and clean(d.get(nome)):
+                    return clean(d.get(nome))
+            return ""
+
+        encontrados = {}
+        amostra_campos = []
+
+        for item in registros:
+            if not isinstance(item, dict):
+                continue
+
+            codigo = primeiro(item, [
+                "codigo", "codigo_vendedor", "codVendedor",
+                "nCodVend", "nCodVendedor", "codigoVendedor"
+            ])
+
+            nome = primeiro(item, [
+                "nome", "nome_vendedor", "nomeVendedor",
+                "cNome", "descricao", "razao_social",
+                "razaoSocial", "fantasia"
+            ])
+
+            email = primeiro(item, [
+                "email", "eMail", "email_vendedor"
+            ])
+
+            inativo = primeiro(item, [
+                "inativo", "inativo_vendedor", "bloqueado"
+            ])
+
+            if len(amostra_campos) < 5:
+                amostra_campos.append({
+                    "chaves": sorted(item.keys()),
+                    "codigo_detectado": codigo,
+                    "nome_detectado": nome,
+                })
+
+            if codigo:
+                encontrados[codigo] = {
+                    "cod_vendedor": codigo,
+                    "nome_omie": nome,
+                    "email": email,
+                    "inativo": inativo,
+                }
+
+        resultado = []
+        encontrados_staging = 0
+        nao_encontrados = []
+
+        for codigo in codigos:
+            cad = encontrados.get(codigo)
+            if cad:
+                encontrados_staging += 1
+                resultado.append({
+                    "cod_vendedor": codigo,
+                    "encontrado": True,
+                    "nome_omie": cad.get("nome_omie", ""),
+                    "email": cad.get("email", ""),
+                    "inativo": cad.get("inativo", ""),
+                })
+            else:
+                nao_encontrados.append(codigo)
+                resultado.append({
+                    "cod_vendedor": codigo,
+                    "encontrado": False,
+                    "nome_omie": "",
+                    "email": "",
+                    "inativo": "",
+                })
+
+        return {
+            "status": "ok",
+            "somente_leitura": True,
+            "omie_api_chamada": True,
+            "endpoint_omie": "geral/vendedores",
+            "call_omie": "ListarVendedores",
+            "chamadas_omie": chamadas,
+            "paginas_lidas": min(chamadas, total_paginas),
+            "registros_cadastro_recebidos": len(registros),
+            "cod_vendedores_staging": len(codigos),
+            "codigos_encontrados_no_cadastro": encontrados_staging,
+            "codigos_nao_encontrados": nao_encontrados,
+            "vendedores": resultado,
+            "amostra_estrutura_resposta": amostra_campos,
+            "base_vendas_alterada": False,
+            "staging_alterada": False,
+            "raw_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+            "proximo_passo": (
+                "Validar COD_VENDEDOR -> nome_omie e cruzar com o de-para "
+                "comercial antes de preencher REP_ID/REPRESENTANTE."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": repr(e),
+            "somente_leitura": True,
+            "omie_api_chamada": True,
+            "base_vendas_alterada": False,
+            "staging_alterada": False,
+            "raw_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+        }
