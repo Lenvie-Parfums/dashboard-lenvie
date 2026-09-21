@@ -6218,3 +6218,233 @@ def consultar_cadastro_vendedores_2025():
             "cursor_2025_alterado": False,
             "cursor_2026_alterado": False,
         }
+
+# ============================================================
+# PREVIA DO DE-PARA DE REPRESENTANTES 2025 - SOMENTE LEITURA
+# ============================================================
+
+@app.get("/omie/base-vendas-2025/previa-mapeamento-representantes")
+def previa_mapeamento_representantes_2025():
+    """
+    Monta uma PREVIA do mapeamento COD_VENDEDOR -> representante para 2025.
+
+    IMPORTANTE:
+    - SOMENTE LEITURA;
+    - não altera staging;
+    - não altera BASE_VENDAS;
+    - não altera RAW;
+    - não altera cursores;
+    - consulta o cadastro de vendedores da Omie apenas para obter o nome oficial.
+
+    O campo REPRESENTANTE_PADRAO é um nome amigável proposto a partir do
+    de-para comercial já validado no projeto. Canais internos/especiais ficam
+    explicitamente marcados para validação antes de qualquer gravação.
+    """
+    try:
+        principal = get_sheets_client()
+        staging = rows_to_objects(
+            principal.get("'BASE_VENDAS_2025_STAGING'!A1:AE20000")
+        )
+
+        # Contagem financeira/NFs por código na staging.
+        resumo = {}
+        for r in staging:
+            cod = clean(r.get("COD_VENDEDOR")) or "(VAZIO)"
+            if cod not in resumo:
+                resumo[cod] = {"nfs": 0, "faturamento": 0.0}
+            resumo[cod]["nfs"] += 1
+            try:
+                v = r.get("VALOR_COMERCIAL")
+                if isinstance(v, (int, float)):
+                    valor = float(v)
+                else:
+                    s = clean(v).replace("R$", "").replace(" ", "")
+                    if "," in s:
+                        s = s.replace(".", "").replace(",", ".")
+                    valor = float(s or 0)
+            except Exception:
+                valor = 0.0
+            resumo[cod]["faturamento"] += valor
+
+        codigos = sorted(c for c in resumo if c != "(VAZIO)")
+
+        # Consulta controlada ao cadastro Omie.
+        omie = get_omie_client()
+        endpoint = "https://app.omie.com.br/api/v1/geral/vendedores/"
+        pagina = 1
+        total_paginas = 1
+        cadastro = {}
+        chamadas = 0
+
+        while pagina <= total_paginas:
+            resp = omie.call(
+                endpoint=endpoint,
+                call="ListarVendedores",
+                param={
+                    "pagina": pagina,
+                    "registros_por_pagina": 100,
+                    "apenas_importado_api": "N",
+                },
+            )
+            chamadas += 1
+            lista = (
+                resp.get("cadastro")
+                or resp.get("vendedores")
+                or resp.get("vendedorCadastro")
+                or resp.get("listaVendedores")
+                or []
+            )
+            if isinstance(lista, dict):
+                lista = [lista]
+
+            for item in lista:
+                if not isinstance(item, dict):
+                    continue
+                cod = clean(item.get("codigo"))
+                if cod:
+                    cadastro[cod] = {
+                        "nome": clean(item.get("nome")),
+                        "inativo": clean(item.get("inativo")),
+                    }
+
+            try:
+                total_paginas = int(resp.get("total_de_paginas") or 1)
+            except Exception:
+                total_paginas = 1
+
+            pagina += 1
+            if chamadas >= 10:
+                break
+
+        # De-para comercial conhecido.
+        # Nomes internos/especiais NÃO são forçados para representante externo.
+        nome_para_padrao = {
+            "ESTILO REPRESENTAÇÕES": "Eliane",
+            "CLEO CONSULTORA DE VENDAS": "Cleo",
+            "MARIA CRISTINA MOURA": "Maria Cristina Moura",
+            "WILLIAM MT": "Guara MT",
+            "ROBERTO ITAQUY": "Roberto",
+            "BRITO E RAMIRES": "Alex Brito",
+            "TALEN COMERCIO": "Talita",
+            "ROMA REPRESENTAÇÕES": "Rose",
+            "LIMA E LIMA REPRESENTACOES LTDA": "Italo",
+            "GOMES E JATENE": "Khamyla",
+            "ALINE FANTIN": "Aline Fantin",
+            "L MORAES DIAS REPRESENTACOES": "Vandira",
+            "WILLIAM MS": "Guara MS",
+            "VANESSA GAMA": "Vanessa",
+            "OLIVEIRA E STURM LTDA": "Cristian/Túlio",
+            "LA DOS SANTOS": "Alda",
+            "DIVINA REPRESENTAÇÕES": "Divina",
+            "FL REPRESENTACOES": "Filipe",
+            "ROMA REPRESENTACAO COMERCIAL LTDA": "Adriano",
+            "DRD REPRESENTAÇÕES LTDA": "Renata",
+            "CAPTA COMERCIAL LTDA": "Patricia",
+            "JEFFERSON LEYSER": "Jefferson",
+            "SG REPRESENTAÇÕES": "Robson",
+            "FR REPRESENTACOES E COMERCIO": "Fernanda",
+        }
+
+        especiais = {
+            "VENDEDOR LOJA VIRTUAL",
+            "CLEIDE ROMANELLI",
+            "VENDA DIRETA",
+            "MARCA PRÓPRIA",
+            "VENDEDOR MARKETING",
+            "SAC",
+            "VENDEDOR SHOP2GETHER",
+            "MOSTRUARIO",
+        }
+
+        itens = []
+        nfs_mapeadas = 0
+        faturamento_mapeado = 0.0
+        nfs_validar = 0
+        faturamento_validar = 0.0
+
+        # Também inclui o código vazio, que não existe no cadastro.
+        universo = sorted(resumo.keys())
+
+        for cod in universo:
+            cad = cadastro.get(cod, {}) if cod != "(VAZIO)" else {}
+            nome = clean(cad.get("nome"))
+            nome_key = nome.upper()
+
+            if nome_key in nome_para_padrao:
+                status = "MAPEADO"
+                rep = nome_para_padrao[nome_key]
+            elif nome_key in especiais:
+                status = "VALIDAR_CANAL_INTERNO"
+                rep = ""
+            elif cod == "0":
+                status = "VALIDAR_CODIGO_ZERO"
+                rep = ""
+            elif cod == "(VAZIO)":
+                status = "VALIDAR_SEM_COD_VENDEDOR"
+                rep = ""
+            elif not nome:
+                status = "NAO_ENCONTRADO_OMIE"
+                rep = ""
+            else:
+                status = "VALIDAR_NOME_NAO_MAPEADO"
+                rep = ""
+
+            nfs = resumo[cod]["nfs"]
+            fat = round(resumo[cod]["faturamento"], 2)
+
+            if status == "MAPEADO":
+                nfs_mapeadas += nfs
+                faturamento_mapeado += fat
+            else:
+                nfs_validar += nfs
+                faturamento_validar += fat
+
+            itens.append({
+                "cod_vendedor": "" if cod == "(VAZIO)" else cod,
+                "nome_omie": nome,
+                "representante_padrao_proposto": rep,
+                "status": status,
+                "nfs_2025": nfs,
+                "faturamento_2025": fat,
+                "inativo_omie": clean(cad.get("inativo")),
+            })
+
+        itens.sort(key=lambda x: (-x["nfs_2025"], x["cod_vendedor"]))
+
+        return {
+            "status": "ok",
+            "somente_leitura": True,
+            "omie_api_chamada": True,
+            "chamadas_omie": chamadas,
+            "total_linhas_staging": len(staging),
+            "mapeados": {
+                "nfs": nfs_mapeadas,
+                "faturamento": round(faturamento_mapeado, 2),
+            },
+            "a_validar": {
+                "nfs": nfs_validar,
+                "faturamento": round(faturamento_validar, 2),
+            },
+            "vendedores": itens,
+            "base_vendas_alterada": False,
+            "staging_alterada": False,
+            "raw_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+            "proximo_passo": (
+                "Validar somente as linhas com status diferente de MAPEADO. "
+                "Nenhuma alteracao foi feita."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": repr(e),
+            "somente_leitura": True,
+            "base_vendas_alterada": False,
+            "staging_alterada": False,
+            "raw_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+        }
