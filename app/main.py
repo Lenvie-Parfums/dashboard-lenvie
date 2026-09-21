@@ -3891,7 +3891,7 @@ def dashboard_executive_kpis(
                 y, m = dt.year, dt.month
             if y != ano or not (mes_inicio <= m <= mes_fim):
                 continue
-            if representante != "ALL" and clean(row.get("REPRESENTANTE")) != representante:
+            if representante != "ALL" and clean(row.get("REPRESENTANTE")).casefold() != clean(representante).casefold():
                 continue
             selecionadas.append(row)
 
@@ -3947,6 +3947,7 @@ def dashboard_canais_internos(
     ano: int = 2025,
     mes_inicio: int = 1,
     mes_fim: int = 12,
+    representante: str = "ALL",
 ):
     """Resumo dos canais internos separado dos representantes, via BASE_VENDAS."""
     try:
@@ -3992,6 +3993,8 @@ def dashboard_canais_internos(
                 continue
 
             nome = clean(row.get("REPRESENTANTE")) or nao_identificado
+            if representante != "ALL" and nome.casefold() != clean(representante).casefold():
+                continue
             valor = to_float(row.get("VALOR_COMERCIAL"))
             nf = clean(row.get("ID_NF")) or clean(row.get("CHAVE_NFE")) or clean(row.get("NUM_NF"))
             cliente = clean(row.get("CNPJ_CPF")) or clean(row.get("COD_CLIENTE"))
@@ -4039,6 +4042,7 @@ def dashboard_canais_internos(
             "ano": ano,
             "mes_inicio": mes_inicio,
             "mes_fim": mes_fim,
+            "representante": representante,
             "faturamento_total": round(total_geral, 2),
             "faturamento_representantes": round(total_representantes, 2),
             "faturamento_canais_internos": round(total_canais, 2),
@@ -4049,6 +4053,70 @@ def dashboard_canais_internos(
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+# ============================================================
+# DASHBOARD - CLIENTES 2025 x 2026
+# ============================================================
+@app.get("/dashboard/clientes-analise")
+def dashboard_clientes_analise(
+    mes_inicio: int = 1,
+    mes_fim: int = 12,
+    representante: str = "ALL",
+    status_cliente: str = "ALL",
+    faturamento_min: float = 0,
+):
+    """Análise comparativa de clientes comerciais válidos via BASE_VENDAS."""
+    try:
+        mes_inicio=max(1,min(int(mes_inicio),12)); mes_fim=max(1,min(int(mes_fim),12))
+        if mes_inicio>mes_fim: mes_inicio,mes_fim=mes_fim,mes_inicio
+        sheets=get_sheets_client()
+        rows=rows_to_objects(sheets.get("BASE_VENDAS!A1:AE50000"))
+        def f(v):
+            try:
+                return float(str(v).replace(".","").replace(",",".")) if isinstance(v,str) and "," in v else float(v or 0)
+            except Exception: return 0.0
+        clientes={}
+        for row in rows:
+            if clean(row.get("VENDA_VALIDA")).upper()!="SIM": continue
+            competencia=clean(row.get("COMPETENCIA"))
+            try: y,mm=[int(x) for x in competencia[:7].split("-")]
+            except Exception:
+                dt=parse_br_date(row.get("DATA_EMISSAO"))
+                if not dt: continue
+                y,mm=dt.year,dt.month
+            if y not in (2025,2026) or not (mes_inicio<=mm<=mes_fim): continue
+            rep=clean(row.get("REPRESENTANTE")) or "NÃO IDENTIFICADO"
+            if representante!="ALL" and rep.casefold()!=clean(representante).casefold(): continue
+            chave=clean(row.get("CNPJ_CPF")) or clean(row.get("COD_CLIENTE"))
+            if not chave: continue
+            c=clientes.setdefault(chave,{"cliente":clean(row.get("CLIENTE_NOME")) or "N/D","cnpj_cpf":clean(row.get("CNPJ_CPF")) or clean(row.get("COD_CLIENTE")),"reps":set(),"f25":0.0,"f26":0.0,"n25":set(),"n26":set(),"u26":""})
+            c["reps"].add(rep); valor=f(row.get("VALOR_COMERCIAL"))
+            nf=clean(row.get("ID_NF")) or clean(row.get("CHAVE_NFE")) or clean(row.get("NUM_NF"))
+            data=clean(row.get("DATA_EMISSAO"))
+            if y==2025:
+                c["f25"]+=valor
+                if nf: c["n25"].add(nf)
+            else:
+                c["f26"]+=valor
+                if nf: c["n26"].add(nf)
+                if data>c["u26"]: c["u26"]=data
+        detalhe=[]
+        for c in clientes.values():
+            f25,f26=round(c["f25"],2),round(c["f26"],2)
+            if f25==0 and f26>0: st="NOVO_2026"
+            elif f25>0 and f26>0: st="RECORRENTE"
+            elif f25>0 and f26==0: st="SEM_RECOMPRA_2026"
+            else: continue
+            if status_cliente!="ALL" and st!=status_cliente: continue
+            if max(f25,f26)<float(faturamento_min or 0): continue
+            var=round(f26-f25,2)
+            detalhe.append({"cliente":c["cliente"],"cnpj_cpf":c["cnpj_cpf"],"representante":" / ".join(sorted(c["reps"])),"faturamento_2025":f25,"faturamento_2026":f26,"variacao_rs":var,"crescimento":round(var/f25,6) if f25 else None,"nfs_2026":len(c["n26"]),"ticket_medio_2026":round(f26/len(c["n26"]),2) if c["n26"] else 0.0,"ultima_compra_2026":c["u26"],"status":st})
+        detalhe.sort(key=lambda x:(x["faturamento_2026"],x["faturamento_2025"]),reverse=True)
+        resumo={"clientes_2025":sum(c["f25"]>0 for c in clientes.values()),"clientes_2026":sum(c["f26"]>0 for c in clientes.values()),"novos_2026":sum(c["f25"]==0 and c["f26"]>0 for c in clientes.values()),"recorrentes":sum(c["f25"]>0 and c["f26"]>0 for c in clientes.values()),"sem_recompra_2026":sum(c["f25"]>0 and c["f26"]==0 for c in clientes.values())}
+        return {"status":"ok","mes_inicio":mes_inicio,"mes_fim":mes_fim,"representante":representante,"resumo":resumo,"clientes":detalhe,"fonte":"BASE_VENDAS","regra_novo":"Comprou em 2026 e não comprou em 2025 no mesmo intervalo de meses."}
+    except Exception as e:
+        return {"status":"error","error":str(e)}
 
 # ============================================================
 # FRONTEND V10
