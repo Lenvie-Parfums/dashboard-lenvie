@@ -4988,3 +4988,282 @@ def publicar_base_vendas_2025(confirmar: str = ""):
         }
     except Exception as e:
         return {"status":"error","error":repr(e)}
+
+# ============================================================
+# BASE_VENDAS 2025 - PROCESSAMENTO EM MICRO-BLOCOS
+# Usar a partir de abril/2025 para evitar timeout/502.
+# ============================================================
+
+@app.post("/omie/base-vendas-2025/iniciar-mes-blocos")
+def iniciar_mes_base_vendas_2025_blocos(confirmar: str = ""):
+    """
+    Prepara o próximo mês da staging para processamento em micro-blocos.
+    NÃO altera BASE_VENDAS, RAW original ou cursores Omie.
+    Cria/zera apenas uma aba temporária no spreadsheet RAW histórico.
+    """
+    if confirmar != "SIM":
+        return {"status":"blocked","message":"Use ?confirmar=SIM","base_vendas_alterada":False}
+
+    try:
+        principal = get_sheets_client()
+        raw = get_raw_historico_sheets_client()
+
+        ctrl = principal.get("'BASE_VENDAS_2025_CONTROLE'!A1:E2")
+        if not ctrl or len(ctrl) < 2:
+            return {"status":"error","error":"CONTROLE_STAGING_AUSENTE","base_vendas_alterada":False}
+
+        mes = int(clean(ctrl[1][1]) or 1)
+        if mes > 12:
+            return {"status":"ok","finalizado":True,"message":"Os 12 meses já foram processados."}
+
+        temp = "BASE2025_TMP_MES"
+        bloco_ctrl = "BASE_VENDAS_2025_BLOCOS_CONTROLE"
+        get_or_create_sheet(raw, temp)
+        get_or_create_sheet(principal, bloco_ctrl)
+
+        raw.api.spreadsheets().values().clear(
+            spreadsheetId=raw.spreadsheet_id, range=f"'{temp}'!A:AF", body={}
+        ).execute()
+        raw.api.spreadsheets().values().update(
+            spreadsheetId=raw.spreadsheet_id, range=f"'{temp}'!A1",
+            valueInputOption="RAW",
+            body={"values":[[
+                "ID_NF","CHAVE_NFE","NUM_NF","SERIE","DATA_EMISSAO","TIPO_NF",
+                "DATA_CANCELAMENTO","ID_PEDIDO","NUM_PEDIDO","COD_CLIENTE","CNPJ_CPF",
+                "CLIENTE_NOME","COD_VENDEDOR","CATEGORIA","ID_ITEM","COD_PRODUTO_OMIE",
+                "SKU","PRODUTO","CFOP","NCM","QUANTIDADE","UNIDADE","VALOR_UNITARIO",
+                "VALOR_PRODUTO","DESCONTO_ITEM","FRETE_ITEM","OUTROS_ITEM",
+                "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON"
+            ]]}
+        ).execute()
+
+        headers = ["ANO","MES","FONTE","PROXIMA_LINHA","STATUS","LINHAS_LIDAS","LINHAS_MES","ATUALIZADO_EM"]
+        row = [2025,mes,"RAW_ANTIGA",2,"EM_ANDAMENTO",0,0,datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+        principal.api.spreadsheets().values().clear(
+            spreadsheetId=principal.spreadsheet_id, range=f"'{bloco_ctrl}'!A:H", body={}
+        ).execute()
+        principal.api.spreadsheets().values().update(
+            spreadsheetId=principal.spreadsheet_id, range=f"'{bloco_ctrl}'!A1",
+            valueInputOption="RAW", body={"values":[headers,row]}
+        ).execute()
+
+        return {
+            "status":"ok","mes":mes,"fonte":"RAW_ANTIGA","proxima_linha":2,
+            "message":"Mês preparado para micro-blocos.",
+            "base_vendas_alterada":False,"raw_original_alterada":False,
+            "cursor_2025_alterado":False,"cursor_2026_alterado":False
+        }
+    except Exception as e:
+        return {"status":"error","error":repr(e),"base_vendas_alterada":False}
+
+
+@app.post("/omie/base-vendas-2025/processar-bloco")
+def processar_bloco_base_vendas_2025(confirmar: str = "", tamanho: int = 3000):
+    """
+    Processa no máximo 'tamanho' linhas físicas por chamada.
+    Filtra o mês alvo e guarda somente essas linhas na aba temporária.
+    Quando RAW_ANTIGA termina, muda automaticamente para RAW_NOVA.
+    """
+    from datetime import datetime as _dt
+
+    if confirmar != "SIM":
+        return {"status":"blocked","message":"Use ?confirmar=SIM","base_vendas_alterada":False}
+    tamanho = max(500, min(int(tamanho), 5000))
+
+    def _dt_local(v):
+        s=clean(v)
+        for f in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%Y %H:%M:%S","%Y-%m-%d %H:%M:%S"):
+            try: return _dt.strptime(s[:19],f)
+            except Exception: pass
+        try: return _dt.fromisoformat(s.replace("Z","+00:00"))
+        except Exception: return None
+
+    try:
+        principal=get_sheets_client()
+        raw=get_raw_historico_sheets_client()
+        caba="BASE_VENDAS_2025_BLOCOS_CONTROLE"
+        vals=principal.get(f"'{caba}'!A1:H2")
+        if not vals or len(vals)<2:
+            return {"status":"error","error":"EXECUTE_INICIAR_MES_BLOCOS_PRIMEIRO","base_vendas_alterada":False}
+
+        c=(list(vals[1])+[""]*8)[:8]
+        ano=int(clean(c[0]) or 2025)
+        mes=int(clean(c[1]) or 0)
+        fonte=clean(c[2])
+        inicio=int(clean(c[3]) or 2)
+        status=clean(c[4])
+        lidas=int(clean(c[5]) or 0)
+        linhas_mes=int(clean(c[6]) or 0)
+
+        if status=="PRONTO_PARA_CONSOLIDAR":
+            return {"status":"ok","mes":mes,"pronto_para_consolidar":True,"message":"Execute finalizar-mes-blocos."}
+
+        if fonte=="RAW_ANTIGA":
+            client=principal; aba="OMIE_NF"
+        else:
+            client=raw; aba="OMIE_NF_2025"
+
+        fim=inicio+tamanho-1
+        dados=client.get(f"'{aba}'!A{inicio}:AF{fim}") or []
+        filtradas=[]
+        for r in dados:
+            rr=(list(r)+[""]*32)[:32]
+            d=_dt_local(rr[4])
+            if d and d.year==ano and d.month==mes:
+                filtradas.append(rr)
+
+        if filtradas:
+            raw.api.spreadsheets().values().append(
+                spreadsheetId=raw.spreadsheet_id,
+                range="'BASE2025_TMP_MES'!A:AF",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values":filtradas}
+            ).execute()
+
+        lidas += len(dados)
+        linhas_mes += len(filtradas)
+        terminou = len(dados) < tamanho
+
+        if terminou and fonte=="RAW_ANTIGA":
+            fonte_nova="RAW_NOVA"; prox=2; novo_status="EM_ANDAMENTO"
+        elif terminou and fonte=="RAW_NOVA":
+            fonte_nova="RAW_NOVA"; prox=inicio+len(dados); novo_status="PRONTO_PARA_CONSOLIDAR"
+        else:
+            fonte_nova=fonte; prox=inicio+len(dados); novo_status="EM_ANDAMENTO"
+
+        row=[ano,mes,fonte_nova,prox,novo_status,lidas,linhas_mes,datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+        principal.api.spreadsheets().values().update(
+            spreadsheetId=principal.spreadsheet_id,range=f"'{caba}'!A2:H2",
+            valueInputOption="RAW",body={"values":[row]}
+        ).execute()
+
+        return {
+            "status":"ok","mes":mes,"fonte_processada":fonte,
+            "intervalo":f"{inicio}:{fim}","linhas_lidas_nesta_chamada":len(dados),
+            "linhas_do_mes_nesta_chamada":len(filtradas),
+            "total_linhas_lidas":lidas,"total_linhas_mes_temporarias":linhas_mes,
+            "proxima_fonte":fonte_nova,"proxima_linha":prox,
+            "pronto_para_consolidar":novo_status=="PRONTO_PARA_CONSOLIDAR",
+            "base_vendas_alterada":False,"raw_original_alterada":False,
+            "cursor_2025_alterado":False,"cursor_2026_alterado":False
+        }
+    except Exception as e:
+        return {"status":"error","error":repr(e),"base_vendas_alterada":False}
+
+
+@app.post("/omie/base-vendas-2025/finalizar-mes-blocos")
+def finalizar_mes_base_vendas_2025_blocos(confirmar: str = ""):
+    """
+    Deduplica apenas as linhas temporárias do mês, consolida NFs e grava o mês
+    na BASE_VENDAS_2025_STAGING. BASE_VENDAS oficial permanece intocada.
+    """
+    from datetime import datetime as _dt
+    if confirmar!="SIM":
+        return {"status":"blocked","message":"Use ?confirmar=SIM","base_vendas_alterada":False}
+
+    CFOP_VENDA={"5.101","5.102","5.113","5.401","5.403","6.101","6.102","6.107","6.108","6.109","6.110","6.113","6.401","6.403"}
+    CFOP_BONIFICACAO={"5.910","6.910"}
+
+    def _dt_local(v):
+        s=clean(v)
+        for f in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%Y %H:%M:%S","%Y-%m-%d %H:%M:%S"):
+            try:return _dt.strptime(s[:19],f)
+            except Exception:pass
+        return None
+
+    def _num(v):
+        s=clean(v)
+        if not s:return 0.0
+        try:return float(s.replace(".","").replace(",",".")) if "," in s else float(s)
+        except Exception:return 0.0
+
+    def _cancel(v):
+        return clean(v).lower() not in ("","none","null","0","false","não","nao")
+
+    try:
+        principal=get_sheets_client()
+        raw=get_raw_historico_sheets_client()
+        c=principal.get("'BASE_VENDAS_2025_BLOCOS_CONTROLE'!A1:H2")
+        if not c or len(c)<2:
+            return {"status":"error","error":"CONTROLE_BLOCOS_AUSENTE","base_vendas_alterada":False}
+        cr=(list(c[1])+[""]*8)[:8]
+        mes=int(clean(cr[1]) or 0)
+        if clean(cr[4])!="PRONTO_PARA_CONSOLIDAR":
+            return {"status":"blocked","message":"Ainda existem blocos para processar.","mes":mes,"base_vendas_alterada":False}
+
+        temp=raw.get("'BASE2025_TMP_MES'!A1:AF60000") or []
+        itens={}
+        duplicadas=0
+        for r in temp[1:]:
+            rr=(list(r)+[""]*32)[:32]
+            d=_dt_local(rr[4])
+            if not d or d.year!=2025 or d.month!=mes:continue
+            idnf=clean(rr[0]); item=clean(rr[14])
+            if not idnf:continue
+            chave=f"{idnf}|{item}" if item else "FALLBACK|"+"|".join([idnf,clean(rr[16]),clean(rr[18]),clean(rr[20]),clean(rr[27])])
+            if chave in itens:
+                duplicadas+=1
+                continue
+            itens[chave]=rr
+
+        nfs={}
+        for r in itens.values():
+            idnf=clean(r[0])
+            if idnf not in nfs:
+                nfs[idnf]={"data":clean(r[4]),"id":idnf,"chave":clean(r[1]),"num":clean(r[2]),"serie":clean(r[3]),
+                "tipo":clean(r[5]),"cancel":clean(r[6]),"idped":clean(r[7]),"numped":clean(r[8]),"codcli":clean(r[9]),
+                "cnpj":clean(r[10]),"cliente":clean(r[11]),"vend":clean(r[12]),"cat":clean(r[13]),"valor_nf":_num(r[30]),
+                "cfops":set(),"venda":set(),"bonif":set(),"pend":set(),"skus":set(),"qtd":0,"iv":0,"ib":0,"ip":0,"vb":0.0}
+            nf=nfs[idnf]
+            if not nf["cancel"] and clean(r[6]):nf["cancel"]=clean(r[6])
+            if not nf["valor_nf"] and _num(r[30]):nf["valor_nf"]=_num(r[30])
+            cfop=clean(r[18]); sku=clean(r[16]); nf["qtd"]+=1
+            if cfop:nf["cfops"].add(cfop)
+            if sku:nf["skus"].add(sku)
+            if cfop in CFOP_VENDA:nf["venda"].add(cfop);nf["iv"]+=1
+            elif cfop in CFOP_BONIFICACAO:nf["bonif"].add(cfop);nf["ib"]+=1;nf["vb"]+=_num(r[27])
+            elif cfop:nf["pend"].add(cfop);nf["ip"]+=1
+
+        rows=[]; canceladas=0
+        for nf in nfs.values():
+            if not nf["venda"]:continue
+            if _cancel(nf["cancel"]):canceladas+=1;continue
+            vnf=round(nf["valor_nf"],2);vb=round(nf["vb"],2);vc=round(vnf-vb,2)
+            rows.append([f"2025-{mes:02d}",nf["data"],nf["id"],nf["chave"],nf["num"],nf["serie"],nf["idped"],nf["numped"],
+            nf["codcli"],nf["cnpj"],nf["cliente"],nf["vend"],nf["vend"],"",nf["cat"],vnf,vc,vb,0.0,nf["tipo"],
+            ";".join(sorted(nf["cfops"])),";".join(sorted(nf["venda"])),";".join(sorted(nf["bonif"])),";".join(sorted(nf["pend"])),
+            nf["qtd"],nf["iv"],nf["ib"],nf["ip"],len(nf["skus"]),"SIM","VENDA_COM_BONIFICACAO" if vb else "VENDA"])
+        rows.sort(key=lambda x:(x[1],x[4]))
+
+        staging=principal.get("'BASE_VENDAS_2025_STAGING'!A1:AE20000")
+        if not staging:raise RuntimeError("STAGING_AUSENTE")
+        header=staging[0]; manter=[]
+        for r in staging[1:]:
+            rr=(list(r)+[""]*31)[:31]
+            if clean(rr[0])!=f"2025-{mes:02d}":manter.append(rr)
+        novo=[header]+manter+rows
+
+        principal.api.spreadsheets().values().clear(
+            spreadsheetId=principal.spreadsheet_id,range="'BASE_VENDAS_2025_STAGING'!A2:AE",body={}
+        ).execute()
+        principal.api.spreadsheets().values().update(
+            spreadsheetId=principal.spreadsheet_id,range="'BASE_VENDAS_2025_STAGING'!A1",
+            valueInputOption="RAW",body={"values":novo}
+        ).execute()
+
+        prox=mes+1
+        principal.api.spreadsheets().values().update(
+            spreadsheetId=principal.spreadsheet_id,range="'BASE_VENDAS_2025_CONTROLE'!A1",
+            valueInputOption="RAW",
+            body={"values":[["ANO","PROXIMO_MES","STATUS","ATUALIZADO_EM","ULTIMO_ERRO"],
+            [2025,prox,"FINALIZADO" if prox>12 else "EM_ANDAMENTO",datetime.now().strftime("%Y-%m-%d %H:%M:%S"),""]]}
+        ).execute()
+
+        return {"status":"ok","mes_processado":mes,"nfs_validas_gravadas_staging":len(rows),"canceladas":canceladas,
+        "faturamento_mes":round(sum(float(r[16]) for r in rows),2),"bonificacao_mes":round(sum(float(r[17]) for r in rows),2),
+        "itens_unicos_mes":len(itens),"duplicidades_temporarias_ignoradas":duplicadas,
+        "proximo_mes":None if prox>12 else prox,"finalizado":prox>12,
+        "base_vendas_alterada":False,"raw_original_alterada":False,"cursor_2025_alterado":False,"cursor_2026_alterado":False}
+    except Exception as e:
+        return {"status":"error","error":repr(e),"base_vendas_alterada":False}
