@@ -4253,3 +4253,360 @@ def previa_final_base_vendas_2025():
             "base_vendas_alterada": False, "cursor_2025_alterado": False,
             "cursor_2026_alterado": False,
         }
+
+# ============================================================
+# GRAVACAO CONTROLADA BASE_VENDAS 2025
+# ============================================================
+
+@app.post("/omie/raw-historico/gravar-base-vendas-2025")
+def gravar_base_vendas_2025(confirmar: str = ""):
+    """
+    Grava SOMENTE 2025 na BASE_VENDAS usando RAW antiga + RAW nova.
+    Preserva integralmente as linhas de outros anos (incluindo 2026).
+    Antes de alterar BASE_VENDAS, cria backup completo em BASE_VENDAS_BACKUP_2025.
+    Não chama Omie e não altera RAW nem cursores.
+
+    Regra final:
+      VALOR_BONIFICADO = soma VALOR_TOTAL_ITEM dos CFOPs 5.910/6.910
+      VALOR_COMERCIAL = VALOR_NF - VALOR_BONIFICADO
+    """
+    from datetime import datetime as _dt
+
+    if confirmar != "SIM":
+        return {
+            "status": "blocked",
+            "message": "Nada foi alterado. Para gravar use ?confirmar=SIM",
+            "omie_api_chamada": False,
+            "base_vendas_alterada": False,
+        }
+
+    HEADER_RAW = [
+        "ID_NF","CHAVE_NFE","NUM_NF","SERIE","DATA_EMISSAO","TIPO_NF",
+        "DATA_CANCELAMENTO","ID_PEDIDO","NUM_PEDIDO","COD_CLIENTE","CNPJ_CPF",
+        "CLIENTE_NOME","COD_VENDEDOR","CATEGORIA","ID_ITEM","COD_PRODUTO_OMIE",
+        "SKU","PRODUTO","CFOP","NCM","QUANTIDADE","UNIDADE","VALOR_UNITARIO",
+        "VALOR_PRODUTO","DESCONTO_ITEM","FRETE_ITEM","OUTROS_ITEM",
+        "VALOR_TOTAL_ITEM","VALOR_PRODUTOS_NF","DESCONTO_NF","VALOR_NF","RAW_JSON",
+    ]
+    HEADER_BASE = [
+        "COMPETENCIA","DATA_EMISSAO","ID_NF","CHAVE_NFE","NUM_NF","SERIE",
+        "ID_PEDIDO","NUM_PEDIDO","COD_CLIENTE","CNPJ_CPF","CLIENTE_NOME",
+        "COD_VENDEDOR","REP_ID","REPRESENTANTE","CATEGORIA","VALOR_NF",
+        "VALOR_COMERCIAL","VALOR_EXCLUIDO","VALOR_PENDENTE","TIPO_NF","CFOPS",
+        "CFOPS_VENDA","CFOPS_EXCLUIDOS","CFOPS_PENDENTES","QTD_ITENS",
+        "ITENS_VENDA","ITENS_EXCLUIDOS","ITENS_PENDENTES","QTD_SKUS",
+        "VENDA_VALIDA","MOTIVO",
+    ]
+
+    CFOP_VENDA = {
+        "5.101","5.102","5.113","5.401","5.403",
+        "6.101","6.102","6.107","6.108","6.109","6.110",
+        "6.113","6.401","6.403",
+    }
+    CFOP_BONIFICACAO = {"5.910","6.910"}
+    CFOP_A_VALIDAR = {"7.101","7.102"}
+
+    def parse_data(v):
+        s = clean(v)
+        if not s:
+            return None
+        for f in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%Y %H:%M:%S","%Y-%m-%d %H:%M:%S"):
+            try:
+                return _dt.strptime(s[:19], f)
+            except Exception:
+                pass
+        try:
+            return _dt.fromisoformat(s.replace("Z","+00:00"))
+        except Exception:
+            return None
+
+    def numero(v):
+        s = clean(v)
+        if not s:
+            return 0.0
+        try:
+            if "," in s:
+                return float(s.replace(".","").replace(",","."))
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def cancelada(v):
+        s = clean(v).strip().lower()
+        return s not in ("", "none", "null", "0", "false", "não", "nao")
+
+    try:
+        principal = get_sheets_client()
+        raw_nova = get_raw_historico_sheets_client()
+
+        # Valida BASE_VENDAS antes de qualquer escrita.
+        atual = principal.get("BASE_VENDAS!A1:AE50000")
+        if not atual or [clean(x) for x in atual[0]] != HEADER_BASE:
+            return {
+                "status": "error",
+                "error": "CABECALHO_BASE_VENDAS_INVALIDO",
+                "base_vendas_alterada": False,
+            }
+
+        # Guarda todas as linhas que NÃO são de 2025. Assim 2026 fica intocado.
+        linhas_outros_anos = []
+        linhas_2025_anteriores = 0
+        for r in atual[1:]:
+            rr = list(r) + [""] * (31 - len(r))
+            rr = rr[:31]
+            comp = clean(rr[0])
+            dt = parse_data(rr[1])
+            ano = dt.year if dt else None
+            if ano is None and len(comp) >= 4:
+                try:
+                    ano = int(comp[:4])
+                except Exception:
+                    ano = None
+            if ano == 2025:
+                linhas_2025_anteriores += 1
+            else:
+                linhas_outros_anos.append(rr)
+
+        # Consolidação lógica ID_NF + ID_ITEM entre as duas RAWs.
+        itens = {}
+        duplicadas = {"RAW_ANTIGA": 0, "RAW_NOVA": 0}
+
+        def carregar(client, aba, origem):
+            cab = client.get(f"'{aba}'!A1:AF1")
+            if not cab or [clean(x) for x in cab[0]] != HEADER_RAW:
+                raise RuntimeError(f"{origem}: CABECALHO_RAW_INVALIDO")
+
+            inicio = 2
+            bloco = 10000
+            while True:
+                dados = client.get(f"'{aba}'!A{inicio}:AF{inicio+bloco-1}")
+                if not dados:
+                    break
+                for pos, r in enumerate(dados):
+                    if not r or not any(clean(x) for x in r):
+                        continue
+                    rr = list(r) + [""] * (32 - len(r))
+                    rr = rr[:32]
+                    dt = parse_data(rr[4])
+                    if not dt or dt.year != 2025:
+                        continue
+
+                    id_nf = clean(rr[0])
+                    id_item = clean(rr[14])
+                    if not id_nf:
+                        continue
+                    if id_item:
+                        chave = f"{id_nf}|{id_item}"
+                    else:
+                        chave = "FALLBACK|" + "|".join([
+                            id_nf, clean(rr[16]), clean(rr[18]),
+                            clean(rr[20]), clean(rr[27])
+                        ])
+
+                    if chave in itens:
+                        duplicadas[origem] += 1
+                        continue
+                    itens[chave] = rr
+
+                if len(dados) < bloco:
+                    break
+                inicio += bloco
+
+        carregar(principal, "OMIE_NF", "RAW_ANTIGA")
+        carregar(raw_nova, "OMIE_NF_2025", "RAW_NOVA")
+
+        nfs = {}
+        for r in itens.values():
+            id_nf = clean(r[0])
+            if id_nf not in nfs:
+                dt = parse_data(r[4])
+                nfs[id_nf] = {
+                    "DATA": clean(r[4]), "MES": dt.month if dt else 0,
+                    "ID_NF": id_nf, "CHAVE": clean(r[1]), "NUM_NF": clean(r[2]),
+                    "SERIE": clean(r[3]), "TIPO": clean(r[5]),
+                    "CANCEL": clean(r[6]), "ID_PEDIDO": clean(r[7]),
+                    "NUM_PEDIDO": clean(r[8]), "COD_CLIENTE": clean(r[9]),
+                    "CNPJ": clean(r[10]), "CLIENTE": clean(r[11]),
+                    "VENDEDOR": clean(r[12]), "CATEGORIA": clean(r[13]),
+                    "VALOR_NF": numero(r[30]),
+                    "CFOPS": set(), "VENDA": set(), "BONIF": set(),
+                    "PEND": set(), "SKUS": set(),
+                    "QTD": 0, "ITENS_VENDA": 0, "ITENS_BONIF": 0,
+                    "ITENS_PEND": 0, "VALOR_BONIF": 0.0,
+                }
+            nf = nfs[id_nf]
+
+            # Completa metadados se a primeira ocorrência vier incompleta.
+            campos = [
+                ("CHAVE",1),("NUM_NF",2),("SERIE",3),("TIPO",5),("CANCEL",6),
+                ("ID_PEDIDO",7),("NUM_PEDIDO",8),("COD_CLIENTE",9),("CNPJ",10),
+                ("CLIENTE",11),("VENDEDOR",12),("CATEGORIA",13)
+            ]
+            for nome, idx in campos:
+                if not nf[nome] and clean(r[idx]):
+                    nf[nome] = clean(r[idx])
+            if not nf["VALOR_NF"] and numero(r[30]):
+                nf["VALOR_NF"] = numero(r[30])
+
+            cfop = clean(r[18])
+            sku = clean(r[16])
+            nf["QTD"] += 1
+            if cfop: nf["CFOPS"].add(cfop)
+            if sku: nf["SKUS"].add(sku)
+
+            if cfop in CFOP_VENDA:
+                nf["VENDA"].add(cfop)
+                nf["ITENS_VENDA"] += 1
+            elif cfop in CFOP_BONIFICACAO:
+                nf["BONIF"].add(cfop)
+                nf["ITENS_BONIF"] += 1
+                nf["VALOR_BONIF"] += numero(r[27])
+            elif cfop:
+                # 7.101/7.102 e qualquer outro não aprovado ficam registrados
+                # como pendentes; porém a auditoria já confirmou que não coexistem
+                # com as NFs comerciais válidas de 2025.
+                nf["PEND"].add(cfop)
+                nf["ITENS_PEND"] += 1
+
+        rows_2025 = []
+        canceladas = 0
+        for nf in nfs.values():
+            if not nf["VENDA"]:
+                continue
+            if cancelada(nf["CANCEL"]):
+                canceladas += 1
+                continue
+
+            valor_nf = round(nf["VALOR_NF"], 2)
+            valor_bonif = round(nf["VALOR_BONIF"], 2)
+            valor_comercial = round(valor_nf - valor_bonif, 2)
+            competencia = f"2025-{nf['MES']:02d}"
+
+            # Mantém o contrato A:AE atual:
+            # VALOR_EXCLUIDO / CFOPS_EXCLUIDOS / ITENS_EXCLUIDOS
+            # passam a representar BONIFICAÇÃO para compatibilidade.
+            rows_2025.append([
+                competencia, nf["DATA"], nf["ID_NF"], nf["CHAVE"], nf["NUM_NF"],
+                nf["SERIE"], nf["ID_PEDIDO"], nf["NUM_PEDIDO"], nf["COD_CLIENTE"],
+                nf["CNPJ"], nf["CLIENTE"], nf["VENDEDOR"], nf["VENDEDOR"], "",
+                nf["CATEGORIA"], valor_nf, valor_comercial, valor_bonif, 0.0,
+                nf["TIPO"], ";".join(sorted(nf["CFOPS"])),
+                ";".join(sorted(nf["VENDA"])), ";".join(sorted(nf["BONIF"])),
+                ";".join(sorted(nf["PEND"])), nf["QTD"], nf["ITENS_VENDA"],
+                nf["ITENS_BONIF"], nf["ITENS_PEND"], len(nf["SKUS"]),
+                "SIM", "VENDA_COM_BONIFICACAO" if valor_bonif else "VENDA",
+            ])
+
+        rows_2025.sort(key=lambda r: (r[0], r[1], r[4]))
+
+        # Travas antes da escrita.
+        faturamento = round(sum(float(r[16] or 0) for r in rows_2025), 2)
+        bonificado = round(sum(float(r[17] or 0) for r in rows_2025), 2)
+
+        if len(rows_2025) != 8285:
+            return {
+                "status": "error", "error": "TRAVA_QTD_NFS_2025",
+                "esperado": 8285, "obtido": len(rows_2025),
+                "base_vendas_alterada": False,
+            }
+        if abs(faturamento - 49550637.37) > 0.05:
+            return {
+                "status": "error", "error": "TRAVA_FATURAMENTO_2025",
+                "esperado": 49550637.37, "obtido": faturamento,
+                "base_vendas_alterada": False,
+            }
+        if abs(bonificado - 381442.32) > 0.05:
+            return {
+                "status": "error", "error": "TRAVA_BONIFICACAO_2025",
+                "esperado": 381442.32, "obtido": bonificado,
+                "base_vendas_alterada": False,
+            }
+
+        # BACKUP COMPLETO antes de tocar na BASE_VENDAS.
+        backup_aba = "BASE_VENDAS_BACKUP_2025"
+        get_or_create_sheet(principal, backup_aba)
+        principal.api.spreadsheets().values().clear(
+            spreadsheetId=principal.spreadsheet_id,
+            range=f"'{backup_aba}'!A:AE", body={}
+        ).execute()
+        principal.api.spreadsheets().values().update(
+            spreadsheetId=principal.spreadsheet_id,
+            range=f"'{backup_aba}'!A1",
+            valueInputOption="RAW",
+            body={"values": atual},
+        ).execute()
+
+        # Valida backup antes da substituição.
+        backup_check = principal.get(f"'{backup_aba}'!A1:AE50000")
+        if len(backup_check) != len(atual):
+            return {
+                "status": "error",
+                "error": "BACKUP_NAO_VALIDADO_BASE_VENDAS_NAO_ALTERADA",
+                "linhas_origem": len(atual),
+                "linhas_backup": len(backup_check),
+                "base_vendas_alterada": False,
+            }
+
+        # Reconstrói BASE: header + 2025 novo + todos os outros anos preservados.
+        final_rows = [HEADER_BASE] + rows_2025 + linhas_outros_anos
+
+        principal.api.spreadsheets().values().clear(
+            spreadsheetId=principal.spreadsheet_id,
+            range="'BASE_VENDAS'!A2:AE", body={}
+        ).execute()
+        principal.api.spreadsheets().values().update(
+            spreadsheetId=principal.spreadsheet_id,
+            range="'BASE_VENDAS'!A1",
+            valueInputOption="RAW",
+            body={"values": final_rows},
+        ).execute()
+
+        # Conferência pós-gravação.
+        gravado = principal.get("BASE_VENDAS!A1:AE50000")
+        objetos = rows_to_objects(gravado)
+        linhas_2025_pos = []
+        linhas_outros_pos = []
+        for obj in objetos:
+            dt = parse_data(obj.get("DATA_EMISSAO"))
+            comp = clean(obj.get("COMPETENCIA"))
+            ano = dt.year if dt else None
+            if ano is None and len(comp) >= 4:
+                try: ano = int(comp[:4])
+                except Exception: ano = None
+            if ano == 2025:
+                linhas_2025_pos.append(obj)
+            else:
+                linhas_outros_pos.append(obj)
+
+        fat_pos = round(sum(numero(x.get("VALOR_COMERCIAL")) for x in linhas_2025_pos
+                            if clean(x.get("VENDA_VALIDA")).upper() == "SIM"), 2)
+
+        return {
+            "status": "ok",
+            "message": "BASE_VENDAS 2025 gravada com backup e preservacao dos demais anos.",
+            "regra": "VALOR_COMERCIAL = VALOR_NF - bonificacao 5.910/6.910",
+            "nfs_2025_gravadas": len(linhas_2025_pos),
+            "nfs_2025_canceladas_nao_gravadas": canceladas,
+            "faturamento_2025": fat_pos,
+            "valor_bonificado_2025": bonificado,
+            "linhas_2025_anteriores_substituidas": linhas_2025_anteriores,
+            "linhas_outros_anos_preservadas_antes": len(linhas_outros_anos),
+            "linhas_outros_anos_preservadas_depois": len(linhas_outros_pos),
+            "backup_aba": backup_aba,
+            "duplicidades_ignoradas": duplicadas,
+            "omie_api_chamada": False,
+            "raw_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+            "proximo_passo": "Validar /dashboard/executive-kpis?ano=2025&mes_inicio=1&mes_fim=12&representante=ALL",
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": repr(e),
+            "omie_api_chamada": False,
+            "raw_alterada": False,
+            "cursor_2025_alterado": False,
+            "cursor_2026_alterado": False,
+        }
