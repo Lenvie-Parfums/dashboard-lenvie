@@ -5514,3 +5514,113 @@ def processar_mes_base_vendas_2025_direto(confirmar: str = ""):
 
     except Exception as e:
         return {"status":"error","error":repr(e),"base_vendas_alterada":False}
+
+# ============================================================
+# REPARO STAGING 2025 - JANEIRO A ABRIL
+# Reusa a rota mensal direta já validada.
+# Não altera BASE_VENDAS oficial.
+# ============================================================
+
+@app.post("/omie/base-vendas-2025/reparar-mes-staging")
+def reparar_mes_staging_2025(mes: int, confirmar: str = ""):
+    """
+    Reprocessa APENAS um mês ausente da staging (1 a 4), reutilizando
+    processar_mes_base_vendas_2025_direto(), que já possui as travas mensais.
+    Preserva todos os demais meses existentes na staging.
+
+    Importante:
+    - Não chama Omie.
+    - Não altera RAW.
+    - Não altera BASE_VENDAS oficial.
+    - Ao terminar, restaura o controle anual para 13/FINALIZADO.
+    """
+    if confirmar != "SIM":
+        return {
+            "status":"blocked",
+            "message":"Use ?mes=1&confirmar=SIM (mes permitido: 1,2,3,4)",
+            "base_vendas_alterada":False
+        }
+
+    if mes not in (1,2,3,4):
+        return {
+            "status":"error",
+            "error":"MES_REPARO_PERMITIDO_APENAS_1_A_4",
+            "base_vendas_alterada":False
+        }
+
+    try:
+        sheets = get_sheets_client()
+
+        # Confere se staging existe antes de tocar no controle.
+        staging = sheets.get("'BASE_VENDAS_2025_STAGING'!A1:AE20000")
+        if not staging:
+            return {"status":"error","error":"STAGING_AUSENTE","base_vendas_alterada":False}
+
+        # Seleciona temporariamente o mês a reparar.
+        ctrl_headers = ["ANO","PROXIMO_MES","STATUS","ATUALIZADO_EM","ULTIMO_ERRO"]
+        ctrl_temp = [
+            2025, mes, "REPARO",
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ""
+        ]
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'BASE_VENDAS_2025_CONTROLE'!A1",
+            valueInputOption="RAW",
+            body={"values":[ctrl_headers, ctrl_temp]}
+        ).execute()
+
+        resultado = processar_mes_base_vendas_2025_direto(confirmar="SIM")
+
+        # Independentemente do mês reparado, o histórico anual já havia chegado
+        # a dezembro. Restauramos o estado final do cursor da staging.
+        ctrl_final = [
+            2025, 13, "FINALIZADO",
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ""
+        ]
+        sheets.api.spreadsheets().values().update(
+            spreadsheetId=sheets.spreadsheet_id,
+            range="'BASE_VENDAS_2025_CONTROLE'!A1",
+            valueInputOption="RAW",
+            body={"values":[ctrl_headers, ctrl_final]}
+        ).execute()
+
+        if not isinstance(resultado, dict):
+            return {
+                "status":"error",
+                "error":"RETORNO_INESPERADO_ROTA_DIRETA",
+                "mes_reparo":mes,
+                "base_vendas_alterada":False
+            }
+
+        resultado = dict(resultado)
+        resultado["operacao"] = "REPARO_STAGING"
+        resultado["mes_reparo"] = mes
+        resultado["controle_restaurado"] = "FINALIZADO"
+        resultado["base_vendas_alterada"] = False
+        resultado["raw_original_alterada"] = False
+        resultado["cursor_2025_alterado"] = False
+        resultado["cursor_2026_alterado"] = False
+        return resultado
+
+    except Exception as e:
+        # Tenta deixar o controle anual em estado final mesmo se houver erro.
+        try:
+            sheets = get_sheets_client()
+            sheets.api.spreadsheets().values().update(
+                spreadsheetId=sheets.spreadsheet_id,
+                range="'BASE_VENDAS_2025_CONTROLE'!A1",
+                valueInputOption="RAW",
+                body={"values":[
+                    ["ANO","PROXIMO_MES","STATUS","ATUALIZADO_EM","ULTIMO_ERRO"],
+                    [2025,13,"FINALIZADO",
+                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"), repr(e)]
+                ]}
+            ).execute()
+        except Exception:
+            pass
+        return {
+            "status":"error",
+            "error":repr(e),
+            "mes_reparo":mes,
+            "base_vendas_alterada":False
+        }
